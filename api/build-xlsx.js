@@ -29,12 +29,15 @@ async function readCsvText({ url, csv, headers }) {
 const SHEET_DET = "Detaljeret oversigt";
 const SHEET_SAP = "SAP";
 
-const TITLE_ROW_INDEX    = 1; // Periode…
-const SUBTITLE_ROW_INDEX = 2; // long supplier list
-const BLANK_ROW_INDEX    = 3; // (unused but reserved)
+const TITLE_ROW_INDEX    = 1; // Periode… (merged)
+const SUBTITLE_ROW_INDEX = 2; // supplier list (merged)
+const BLANK_ROW_INDEX    = 3; // blank/reserved
 const HEADER_ROW_INDEX   = 4;
 
 const BORDER = { style: "thin", color: { argb: "FF000000" } };
+
+/* If true, text (non-summed) numeric-looking values will be rendered with a literal semicolon thousands separator, e.g. 1111.11 -> "1;111.11" */
+const DISPLAY_SEMICOLON_FOR_TEXT_NUMBERS = true;
 
 const SAP_HEADERS = [
   "Kontrakt","Position","Artskonto","Besrkivelse","Profitcenter",
@@ -66,15 +69,23 @@ const SAP_NUMERIC_HEADERS = new Set([
   "Pris inkl. moms","Pris ex. moms"
 ]);
 
+/* Danish-friendly number parsing; also handles 1,234.56 / 1.234,56 variants */
 function toNumberMaybe(v) {
   if (v === null || v === undefined) return null;
-  if (typeof v === "number") return v;
+  if (typeof v === "number") return Number.isFinite(v) ? v : null;
   let s = String(v).trim();
   if (!s) return null;
+
+  // remove spaces
   s = s.replace(/\s+/g, "");
+
+  // 1.234,56 -> 1234.56
   if (/^\d{1,3}(\.\d{3})*(,\d+)?$/.test(s)) s = s.replace(/\./g, "").replace(",", ".");
+  // 1234,56 -> 1234.56
   else if (/^\d+,\d+$/.test(s)) s = s.replace(",", ".");
-  if (/^\d{1,3}(,\d{3})+$/.test(s)) s = s.replace(/,/g, "");
+  // 1,234,567.89 -> 1234567.89
+  if (/^\d{1,3}(,\d{3})+(\.\d+)?$/.test(s)) s = s.replace(/,/g, "");
+
   const n = Number(s);
   return Number.isFinite(n) ? n : null;
 }
@@ -82,8 +93,13 @@ function toNumberMaybe(v) {
 /* Keep day columns (1–31) as text; coerce only known numeric fields */
 function coerceByHeader(header, value) {
   const h = (header || "").trim();
-  if (/^\d{1,2}$/.test(h)) return value === "" ? null : value; // day columns -> text (K/S)
-  if (DET_NUMERIC_HEADERS.has(h) || SAP_NUMERIC_HEADERS.has(h)) return toNumberMaybe(value);
+  if (/^\d{1,2}$/.test(h)) {
+    // day columns => always text (K/S or other markers/strings)
+    return value === "" ? null : String(value);
+  }
+  if (DET_NUMERIC_HEADERS.has(h) || SAP_NUMERIC_HEADERS.has(h)) {
+    return toNumberMaybe(value);
+  }
   return value === "" ? null : value;
 }
 
@@ -173,7 +189,28 @@ function getValueForHeader(obj, hdr) {
   return k ? obj[k] : null;
 }
 
-/* -------------------- Robust CSV parsing -------------------- */
+/* -------------------- Display helpers -------------------- */
+
+/** Return a string like "1;111.11" for a numeric input. */
+function formatWithSemicolons(n) {
+  if (n === null || n === undefined || n === "") return null;
+  const num = typeof n === "number" ? n : toNumberMaybe(n);
+  if (!Number.isFinite(num)) return String(n);
+
+  const parts = num.toFixed(2).split(".");
+  let intPart = parts[0];
+  const fracPart = parts[1] ?? "00";
+
+  // Insert semicolons for thousands groups from the right
+  const rgx = /(\d+)(\d{3})/;
+  while (rgx.test(intPart)) {
+    intPart = intPart.replace(rgx, "$1;$2");
+  }
+  return `${intPart}.${fracPart}`;
+}
+
+/* -------------------- Robust CSV parsing (no row dropping) -------------------- */
+
 function findHeaderIndex(rows, expectCandidates) {
   let bestIdx = -1, bestScore = -1;
   for (let i = 0; i < Math.min(rows.length, 12); i++) {
@@ -202,9 +239,12 @@ function isNoiseRow(arr) {
   return false;
 }
 
-/* Returns { title, subtitle, headers, rows } */
-function parseCsvFlexible(text, expectedHeaders, opts = {}) {
-  const { identityKeys = [], valueKeys = [], dayKeys = [] } = opts;
+/**
+ * Returns { title, subtitle, headers, rows }.
+ * IMPORTANT CHANGE: Do NOT filter based on identity/value/day heuristics.
+ * We keep every non-noise row after the header so row N in CSV -> row N in sheet (offset by the fixed header rows).
+ */
+function parseCsvFlexible(text, expectedHeaders) {
   const clean = (text || "").replace(/^\uFEFF/, "");
 
   // Try multiple delimiters and pick the one with the best header match score
@@ -231,7 +271,7 @@ function parseCsvFlexible(text, expectedHeaders, opts = {}) {
     if (pieces.length) { subtitle = pieces.join("  "); break; }
   }
 
-  // Headers & data
+  // Headers & data (NO heuristic dropping)
   const headers = (rows[headerIdx] || []).map(x => (x ?? "").toString().trim());
   const data = [];
   for (let i = headerIdx + 1; i < rows.length; i++) {
@@ -243,17 +283,7 @@ function parseCsvFlexible(text, expectedHeaders, opts = {}) {
       const key = headers[c] || `col_${c + 1}`;
       obj[key] = arr[c] ?? "";
     }
-
-    const nonEmptyCount = arr.filter(v => (v ?? "").toString().trim() !== "").length;
-    const firstNonEmpty  = (arr[0] ?? "").toString().trim() !== "";
-
-    const hasIdentity = identityKeys.some(k => ((obj[k] ?? "").toString().trim() !== ""));
-    const hasValues   = valueKeys.some(k   => ((obj[k] ?? "").toString().trim() !== ""));
-    const hasDays     = dayKeys.some(k     => ((obj[k] ?? "").toString().trim() !== ""));
-
-    if (hasIdentity || hasValues || hasDays || (firstNonEmpty && nonEmptyCount === 1)) {
-      data.push(obj);
-    }
+    data.push(obj);
   }
 
   return { title, subtitle, headers, rows: data };
@@ -281,23 +311,10 @@ module.exports = async (req, res) => {
     const sapText = await readCsvText({ url: sheet1_url, csv: sheet1_csv, headers: sheet1_headers });
     const detText = await readCsvText({ url: sheet2_url, csv: sheet2_csv, headers: sheet2_headers });
 
-    const sapParsed = parseCsvFlexible(sapText, SAP_HEADERS, {
-      identityKeys: ["Kontrakt", "Lokation/rute", "Kunde"],
-      valueKeys: ["Pris inkl. moms", "Pris ex. moms"],
-    });
+    const sapParsed = parseCsvFlexible(sapText, SAP_HEADERS);
+    const detParsed = parseCsvFlexible(detText, [...DET_BASE_HEADERS, ...detDaysAll]);
 
-    const detParsed = parseCsvFlexible(detText, [...DET_BASE_HEADERS, ...detDaysAll], {
-      identityKeys: ["Øko-ID", "Rute/lokation", "Lokationsnavn"],
-      valueKeys: [
-        "I alt, kr","Saltning, kr","Salt, antal","Salt, gns. pris",
-        "Kombi, kr","Kombi, antal","Kombi, gns. pris",
-        "Snerydning, kr","Sne, antal",
-        "Andet, kr","Andet, antal","Salt, kg",
-      ],
-      dayKeys: detDaysAll,
-    });
-
-    // Dynamic day columns present
+    // Dynamic day columns present in Detaljeret
     const detDays = detParsed.headers.map(h => (h || "").trim()).filter(h => /^\d{1,2}$/.test(h));
     const DET_HEADERS = [...DET_BASE_HEADERS, ...detDays];
     const DET_WIDTHS  = [...DET_BASE_WIDTHS, ...new Array(detDays.length).fill(DAY_COL_WIDTH)];
@@ -311,7 +328,7 @@ module.exports = async (req, res) => {
     wsDET.columns = DET_WIDTHS.map(w => ({ width: w }));
     setTitle(wsDET, detParsed.title || sapParsed.title || "", DET_HEADERS.length);
 
-    // Prefer the Detaljeret subtitle; if absent, use SAP’s
+    // Prefer Detaljeret subtitle; if absent, use SAP’s
     const subtitleText = detParsed.subtitle || sapParsed.subtitle || "";
     setSubtitle(wsDET, subtitleText, DET_HEADERS.length);
 
@@ -322,33 +339,57 @@ module.exports = async (req, res) => {
       const row = wsDET.getRow(r);
       DET_HEADERS.forEach((hdr, i) => {
         const raw = getValueForHeader(obj, hdr);
-        const val = coerceByHeader(hdr, raw);
+        const coerced = coerceByHeader(hdr, raw);
         const cell = row.getCell(i + 1);
 
-        if (/^\d{1,2}$/.test(hdr)) {           // day columns
-          cell.value = val === "" ? null : val;
+        if (/^\d{1,2}$/.test(hdr)) {
+          // Day columns: keep as text; optionally semicolon-format numeric-looking strings
+          if (coerced === null) {
+            cell.value = null;
+          } else {
+            const asNum = toNumberMaybe(coerced);
+            if (DISPLAY_SEMICOLON_FOR_TEXT_NUMBERS && Number.isFinite(asNum)) {
+              cell.value = formatWithSemicolons(asNum);
+            } else {
+              cell.value = String(coerced);
+            }
+          }
           cell.numFmt = "General";
-        } else if (typeof val === "number") {  // numeric
-          cell.value = Number(val);
-          if (/antal|kg/.test(hdr.toLowerCase())) cell.numFmt = "0";
+        } else if (typeof coerced === "number") {
+          // Real numeric columns that we sum — keep numeric for formulas
+          cell.value = Number(coerced);
+          if (/antal|kg/i.test(hdr)) cell.numFmt = "0";
           else cell.numFmt = "#,##0.00";
-        } else {                               // text
-          cell.value = val === "" ? null : val;
+        } else {
+          // Other text columns
+          if (DISPLAY_SEMICOLON_FOR_TEXT_NUMBERS) {
+            // If it's a numeric-looking string but we don't sum it, show with semicolons anyway
+            const asNum = toNumberMaybe(coerced);
+            if (asNum !== null && !DET_NUMERIC_HEADERS.has(hdr)) {
+              cell.value = formatWithSemicolons(asNum);
+            } else {
+              cell.value = coerced === null ? null : String(coerced);
+            }
+          } else {
+            cell.value = coerced === null ? null : String(coerced);
+          }
         }
       });
       row.commit();
       r++;
     });
+
+    const detFirstDataRow = HEADER_ROW_INDEX + 1;
     const detLast = r - 1;
-    if (detLast >= HEADER_ROW_INDEX + 1) {
-      addBorders(wsDET, HEADER_ROW_INDEX + 1, detLast, 1, DET_HEADERS.length);
+    if (detLast >= detFirstDataRow) {
+      addBorders(wsDET, detFirstDataRow, detLast, 1, DET_HEADERS.length);
       const j = DET_HEADERS.indexOf("I alt, kr") + 1;
       const k = DET_HEADERS.indexOf("Saltning, kr") + 1;
       const l = DET_HEADERS.indexOf("Salt, antal") + 1;
       const m = DET_HEADERS.indexOf("Salt, gns. pris") + 1;
       const detTotalsRow = detLast + 1;
       const colsToSum = [j, k, l, m].filter(Boolean);
-      if (colsToSum.length) writeSumFormulas(wsDET, detTotalsRow, colsToSum, HEADER_ROW_INDEX + 1, detLast);
+      if (colsToSum.length) writeSumFormulas(wsDET, detTotalsRow, colsToSum, detFirstDataRow, detLast);
       writeFooter(wsDET, 1, 3, detTotalsRow, footerDate);
     } else {
       writeFooter(wsDET, 1, 3, HEADER_ROW_INDEX, footerDate);
@@ -365,26 +406,38 @@ module.exports = async (req, res) => {
       const row = wsSAP.getRow(r);
       SAP_HEADERS.forEach((hdr, i) => {
         const raw = getValueForHeader(obj, hdr);
-        const val = coerceByHeader(hdr, raw);
+        const coerced = coerceByHeader(hdr, raw);
         const cell = row.getCell(i + 1);
 
-        if (typeof val === "number") {
-          cell.value = Number(val);
-          if (/moms/.test(hdr.toLowerCase())) cell.numFmt = "#,##0.00";
+        if (typeof coerced === "number") {
+          cell.value = Number(coerced);
+          if (/moms/i.test(hdr)) cell.numFmt = "#,##0.00";
           else cell.numFmt = "0";
         } else {
-          cell.value = val === "" ? null : val;
+          // Keep as text; optionally display semicolon-formatted if numeric-looking but not summed
+          if (DISPLAY_SEMICOLON_FOR_TEXT_NUMBERS) {
+            const asNum = toNumberMaybe(coerced);
+            if (asNum !== null && !SAP_NUMERIC_HEADERS.has(hdr)) {
+              cell.value = formatWithSemicolons(asNum);
+            } else {
+              cell.value = coerced === null ? null : String(coerced);
+            }
+          } else {
+            cell.value = coerced === null ? null : String(coerced);
+          }
         }
       });
       row.commit();
       r++;
     });
+
+    const sapFirstDataRow = HEADER_ROW_INDEX + 1;
     const sapLast = r - 1;
-    if (sapLast >= HEADER_ROW_INDEX + 1) {
-      addBorders(wsSAP, HEADER_ROW_INDEX + 1, sapLast, 1, SAP_HEADERS.length);
+    if (sapLast >= sapFirstDataRow) {
+      addBorders(wsSAP, sapFirstDataRow, sapLast, 1, SAP_HEADERS.length);
       const h = SAP_HEADERS.indexOf("Pris ex. moms") + 1;
       const sapTotalsRow = sapLast + 1;
-      if (h) writeSumFormulas(wsSAP, sapTotalsRow, [h], HEADER_ROW_INDEX + 1, sapLast);
+      if (h) writeSumFormulas(wsSAP, sapTotalsRow, [h], sapFirstDataRow, sapLast);
       writeFooter(wsSAP, 1, 3, sapTotalsRow, footerDate);
     } else {
       writeFooter(wsSAP, 1, 3, HEADER_ROW_INDEX, footerDate);
