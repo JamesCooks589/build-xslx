@@ -36,9 +36,6 @@ const HEADER_ROW_INDEX   = 4;
 
 const BORDER = { style: "thin", color: { argb: "FF000000" } };
 
-/* If true, text (non-summed) numeric-looking values will be rendered with a literal semicolon thousands separator, e.g. 1111.11 -> "1;111.11" */
-const DISPLAY_SEMICOLON_FOR_TEXT_NUMBERS = true;
-
 const SAP_HEADERS = [
   "Kontrakt","Position","Artskonto","Besrkivelse","Profitcenter",
   "Pris inkl. moms","Momskode","Pris ex. moms","Lokation/rute","Kunde"
@@ -189,28 +186,7 @@ function getValueForHeader(obj, hdr) {
   return k ? obj[k] : null;
 }
 
-/* -------------------- Display helpers -------------------- */
-
-/** Return a string like "1;111.11" for a numeric input. */
-function formatWithSemicolons(n) {
-  if (n === null || n === undefined || n === "") return null;
-  const num = typeof n === "number" ? n : toNumberMaybe(n);
-  if (!Number.isFinite(num)) return String(n);
-
-  const parts = num.toFixed(2).split(".");
-  let intPart = parts[0];
-  const fracPart = parts[1] ?? "00";
-
-  // Insert semicolons for thousands groups from the right
-  const rgx = /(\d+)(\d{3})/;
-  while (rgx.test(intPart)) {
-    intPart = intPart.replace(rgx, "$1;$2");
-  }
-  return `${intPart}.${fracPart}`;
-}
-
 /* -------------------- Robust CSV parsing (no row dropping) -------------------- */
-
 function findHeaderIndex(rows, expectCandidates) {
   let bestIdx = -1, bestScore = -1;
   for (let i = 0; i < Math.min(rows.length, 12); i++) {
@@ -241,8 +217,8 @@ function isNoiseRow(arr) {
 
 /**
  * Returns { title, subtitle, headers, rows }.
- * IMPORTANT CHANGE: Do NOT filter based on identity/value/day heuristics.
- * We keep every non-noise row after the header so row N in CSV -> row N in sheet (offset by the fixed header rows).
+ * IMPORTANT: We do NOT filter on identity/value/day heuristics.
+ * Every non-noise row after the header is kept so row order is preserved.
  */
 function parseCsvFlexible(text, expectedHeaders) {
   const clean = (text || "").replace(/^\uFEFF/, "");
@@ -339,40 +315,33 @@ module.exports = async (req, res) => {
       const row = wsDET.getRow(r);
       DET_HEADERS.forEach((hdr, i) => {
         const raw = getValueForHeader(obj, hdr);
-        const coerced = coerceByHeader(hdr, raw);
+        const val = coerceByHeader(hdr, raw);
         const cell = row.getCell(i + 1);
 
         if (/^\d{1,2}$/.test(hdr)) {
-          // Day columns: keep as text; optionally semicolon-format numeric-looking strings
-          if (coerced === null) {
-            cell.value = null;
-          } else {
-            const asNum = toNumberMaybe(coerced);
-            if (DISPLAY_SEMICOLON_FOR_TEXT_NUMBERS && Number.isFinite(asNum)) {
-              cell.value = formatWithSemicolons(asNum);
-            } else {
-              cell.value = String(coerced);
-            }
-          }
+          // Day columns: keep as text (e.g., K/S flags)
+          cell.value = val === null ? null : String(val);
           cell.numFmt = "General";
-        } else if (typeof coerced === "number") {
-          // Real numeric columns that we sum — keep numeric for formulas
-          cell.value = Number(coerced);
-          if (/antal|kg/i.test(hdr)) cell.numFmt = "0";
-          else cell.numFmt = "#,##0.00";
+        } else if (typeof val === "number") {
+          // Summed numeric columns remain numeric
+          cell.value = Number(val);
+
+          // Number format rules:
+          // - currency columns ending with ", kr" => thousands and NO decimals (e.g., 570.843 on Danish locale)
+          // - "gns. pris" (average price) => thousands + 2 decimals
+          // - quantities ("antal", "kg") => integer
+          if (/, kr$/i.test(hdr)) {
+            cell.numFmt = "#,##0";           // no decimals
+          } else if (/gns\. pris/i.test(hdr)) {
+            cell.numFmt = "#,##0.00";        // keep cents
+          } else if (/antal|kg/i.test(hdr)) {
+            cell.numFmt = "0";               // integer
+          } else {
+            cell.numFmt = "#,##0.00";        // fallback
+          }
         } else {
           // Other text columns
-          if (DISPLAY_SEMICOLON_FOR_TEXT_NUMBERS) {
-            // If it's a numeric-looking string but we don't sum it, show with semicolons anyway
-            const asNum = toNumberMaybe(coerced);
-            if (asNum !== null && !DET_NUMERIC_HEADERS.has(hdr)) {
-              cell.value = formatWithSemicolons(asNum);
-            } else {
-              cell.value = coerced === null ? null : String(coerced);
-            }
-          } else {
-            cell.value = coerced === null ? null : String(coerced);
-          }
+          cell.value = val === null ? null : String(val);
         }
       });
       row.commit();
@@ -406,25 +375,15 @@ module.exports = async (req, res) => {
       const row = wsSAP.getRow(r);
       SAP_HEADERS.forEach((hdr, i) => {
         const raw = getValueForHeader(obj, hdr);
-        const coerced = coerceByHeader(hdr, raw);
+        const val = coerceByHeader(hdr, raw);
         const cell = row.getCell(i + 1);
 
-        if (typeof coerced === "number") {
-          cell.value = Number(coerced);
-          if (/moms/i.test(hdr)) cell.numFmt = "#,##0.00";
-          else cell.numFmt = "0";
+        if (typeof val === "number") {
+          cell.value = Number(val);
+          // Prices in SAP: keep two decimals
+          if (/moms/i.test(hdr)) cell.numFmt = "#,##0.00"; else cell.numFmt = "0";
         } else {
-          // Keep as text; optionally display semicolon-formatted if numeric-looking but not summed
-          if (DISPLAY_SEMICOLON_FOR_TEXT_NUMBERS) {
-            const asNum = toNumberMaybe(coerced);
-            if (asNum !== null && !SAP_NUMERIC_HEADERS.has(hdr)) {
-              cell.value = formatWithSemicolons(asNum);
-            } else {
-              cell.value = coerced === null ? null : String(coerced);
-            }
-          } else {
-            cell.value = coerced === null ? null : String(coerced);
-          }
+          cell.value = val === null ? null : String(val);
         }
       });
       row.commit();
