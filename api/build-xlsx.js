@@ -29,9 +29,9 @@ async function readCsvText({ url, csv, headers }) {
 const SHEET_DET = "Detaljeret oversigt";
 const SHEET_SAP = "SAP";
 
-const TITLE_ROW_INDEX    = 1;
-const SUBTITLE_ROW_INDEX = 2;
-const BLANK_ROW_INDEX    = 3;
+const TITLE_ROW_INDEX    = 1; // Periode… (merged)
+const SUBTITLE_ROW_INDEX = 2; // optional (merged)
+const BLANK_ROW_INDEX    = 3; // reserved
 const HEADER_ROW_INDEX   = 4;
 
 const BORDER = { style: "thin", color: { argb: "FF000000" } };
@@ -66,7 +66,7 @@ const SAP_NUMERIC_HEADERS = new Set([
   "Pris inkl. moms","Pris ex. moms"
 ]);
 
-/* Danish-friendly number parsing; also handles 1,234.56 / 1.234,56 variants */
+/* Danish/intl-friendly number parsing */
 function toNumberMaybe(v) {
   if (v === null || v === undefined) return null;
   if (typeof v === "number") return Number.isFinite(v) ? v : null;
@@ -159,21 +159,28 @@ function numberToColumn(n) {
   return s;
 }
 
-/* Format as text using ';' as thousands separator and '.' as decimal.
-   decimals: 0 / 2 / 3 etc. */
-function formatWithSemicolons(num, decimals = 3) {
-  if (num === null || num === undefined || Number.isNaN(num)) return null;
-  const n = typeof num === "number" ? num : toNumberMaybe(num);
-  if (!Number.isFinite(n)) return null;
-
-  const fixed = n.toFixed(decimals);
-  let [intPart, fracPart = ""] = fixed.split(".");
-  const rgx = /(\d+)(\d{3})/;
-  while (rgx.test(intPart)) intPart = intPart.replace(rgx, "$1;$2");
-  return fracPart ? `${intPart}.${fracPart}` : intPart;
+function writeSumFormulas(ws, totalRow, colIndexes, startRow, endRow) {
+  colIndexes.forEach(ci => {
+    const colLetter = numberToColumn(ci);
+    const cell = ws.getCell(totalRow, ci);
+    cell.value = { formula: `SUM(${colLetter}${startRow}:${colLetter}${endRow})` };
+    cell.font = { bold: true };
+  });
+  const maxCol = Math.max(...colIndexes);
+  for (let c = 1; c <= maxCol; c++) {
+    ws.getCell(totalRow, c).border = { top: BORDER, left: BORDER, right: BORDER, bottom: BORDER };
+  }
 }
 
-/* -------------------- Robust CSV parsing (no row dropping) -------------------- */
+/* Loose header lookup (case/commas) */
+function getValueForHeader(obj, hdr) {
+  if (obj[hdr] !== undefined) return obj[hdr];
+  const target = stripComma(hdr);
+  const k = Object.keys(obj).find(key => norm(key) === norm(hdr) || stripComma(key) === target);
+  return k ? obj[k] : null;
+}
+
+/* -------------------- CSV parsing without row dropping -------------------- */
 function findHeaderIndex(rows, expectCandidates) {
   let bestIdx = -1, bestScore = -1;
   for (let i = 0; i < Math.min(rows.length, 12); i++) {
@@ -201,9 +208,9 @@ function isNoiseRow(arr) {
   return false;
 }
 
-/* Keep every non-noise row after the header to preserve row order */
 function parseCsvFlexible(text, expectedHeaders) {
   const clean = (text || "").replace(/^\uFEFF/, "");
+
   const candidates = [";", ",", "\t"];
   let best = { rows: [], headerIdx: -1, score: -1, delimiter: ";" };
   for (const d of candidates) {
@@ -212,12 +219,14 @@ function parseCsvFlexible(text, expectedHeaders) {
   }
   const rows = best.rows;
 
+  // Title in first row if "Periode…"
   let title = "";
   const t0 = (rows[0]?.[0] || "").toString().replace(/^"+|"+$/g, "");
   if (norm(t0).startsWith("periode")) title = t0;
 
   const headerIdx = best.headerIdx >= 0 ? best.headerIdx : 0;
 
+  // Subtitle: first non-empty line between title and header
   let subtitle = "";
   for (let i = 1; i < headerIdx; i++) {
     const line = rows[i] || [];
@@ -225,6 +234,7 @@ function parseCsvFlexible(text, expectedHeaders) {
     if (pieces.length) { subtitle = pieces.join("  "); break; }
   }
 
+  // Headers & data (NO heuristic dropping)
   const headers = (rows[headerIdx] || []).map(x => (x ?? "").toString().trim());
   const data = [];
   for (let i = headerIdx + 1; i < rows.length; i++) {
@@ -238,6 +248,7 @@ function parseCsvFlexible(text, expectedHeaders) {
     }
     data.push(obj);
   }
+
   return { title, subtitle, headers, rows: data };
 }
 
@@ -272,126 +283,77 @@ module.exports = async (req, res) => {
     const DET_WIDTHS  = [...DET_BASE_WIDTHS, ...new Array(detDays.length).fill(DAY_COL_WIDTH)];
     const footerDate = extracted_at || todayDk();
 
-    // ---------------- Hidden numeric helpers for J..P ----------------
-    // We will append 7 hidden columns that mirror J..P (I alt, kr .. Kombi, gns. pris)
-    const HELPER_LABEL_PREFIX = "__num__"; // won't collide with visible headers
-    const visibleJPHeaders = ["I alt, kr","Saltning, kr","Salt, antal","Salt, gns. pris","Kombi, kr","Kombi, antal","Kombi, gns. pris"];
-    const helperHeaders = visibleJPHeaders.map(h => `${HELPER_LABEL_PREFIX}${h}`);
-
     const wb = new ExcelJS.Workbook();
     wb.calcProperties.fullCalcOnLoad = true;
 
     /* -------- Detaljeret oversigt (first tab) -------- */
     const wsDET = wb.addWorksheet(SHEET_DET);
-
-    // Configure visible columns + hidden helpers
-    const fullWidths = [...DET_WIDTHS, ...new Array(helperHeaders.length).fill(0.5)];
-    wsDET.columns = fullWidths.map((w, i) => ({
-      width: w,
-      hidden: i >= DET_WIDTHS.length // helpers hidden
-    }));
+    wsDET.columns = DET_WIDTHS.map(w => ({ width: w }));
 
     setTitle(wsDET, detParsed.title || sapParsed.title || "", DET_HEADERS.length);
     const subtitleText = detParsed.subtitle || sapParsed.subtitle || "";
     setSubtitle(wsDET, subtitleText, DET_HEADERS.length);
 
-    // Write header row (only visible headers)
-    writeHeader(wsDET, [...DET_HEADERS, ...helperHeaders]); // include helper labels so we can reference them
-
-    // Build header -> index map (including helpers)
-    const headerToIndex = {};
-    [...DET_HEADERS, ...helperHeaders].forEach((h, i) => { headerToIndex[h] = i + 1; });
-
-    // Decide decimals for J..P visible text:
-    // - "antal"/"kg" -> 0 decimals
-    // - others -> 3 decimals (as you requested 1;111.111)
-    const decimalsForHeader = (hdr) => (/antal|kg/i.test(hdr) ? 0 : 3);
-
-    // Track totals for selected columns (keep your original: J,K,L,M)
-    const sumHeaders = new Set(["I alt, kr","Saltning, kr","Salt, antal","Salt, gns. pris"]);
-    const runningTotals = Object.fromEntries(visibleJPHeaders.map(h => [h, 0]));
+    writeHeader(wsDET, DET_HEADERS);
 
     let r = HEADER_ROW_INDEX + 1;
     detParsed.rows.forEach(obj => {
       const row = wsDET.getRow(r);
-
-      // Write all visible headers (text or numbers depending on column)
       DET_HEADERS.forEach((hdr, i) => {
         const raw = getValueForHeader(obj, hdr);
-        const coerced = coerceByHeader(hdr, raw);
+        const val = coerceByHeader(hdr, raw);
         const cell = row.getCell(i + 1);
 
         if (/^\d{1,2}$/.test(hdr)) {
-          // Day columns — text (K/S etc.)
-          cell.value = coerced === null ? null : String(coerced);
+          // Day columns: keep as text (K/S markers, etc.)
+          cell.value = val === null ? null : String(val);
           cell.numFmt = "General";
-        } else if (visibleJPHeaders.includes(hdr)) {
-          // J..P visible columns: display as TEXT with semicolon thousands
-          const num = toNumberMaybe(coerced);
-          const decimals = decimalsForHeader(hdr);
-          const txt = num === null ? null : formatWithSemicolons(num, decimals);
-          cell.value = txt;
+        } else if (typeof val === "number") {
+          // Numeric columns: keep numeric; format by type
+          cell.value = Number(val);
 
-          // Also write the numeric to the hidden helper column
-          const helperCol = headerToIndex[`${HELPER_LABEL_PREFIX}${hdr}`];
-          if (helperCol) {
-            const helperCell = row.getCell(helperCol);
-            helperCell.value = num;
-            helperCell.numFmt = decimals === 0 ? "0" : "#,##0.000";
-            if (Number.isFinite(num)) runningTotals[hdr] += num;
+          // ——— Formatting rules (J→P are covered by these headers) ———
+          // Any header ending with ', kr' or containing 'gns. pris' => 3 decimals
+          // Counts/weights ('antal', 'kg') => 0 decimals
+          if (/, kr$/i.test(hdr) || /gns\. pris/i.test(hdr)) {
+            cell.numFmt = "#,##0.000";
+          } else if (/antal|kg/i.test(hdr)) {
+            cell.numFmt = "0";
+          } else {
+            cell.numFmt = "#,##0.000"; // fallback: 3 decimals to match your example
           }
-        } else if (typeof coerced === "number") {
-          // Other numeric columns not in J..P — keep numeric as before
-          cell.value = Number(coerced);
-          if (/antal|kg/i.test(hdr)) cell.numFmt = "0";
-          else if (/gns\. pris/i.test(hdr)) cell.numFmt = "#,##0.00";
-          else cell.numFmt = "#,##0.00";
         } else {
-          cell.value = coerced === null ? null : String(coerced);
+          // Text columns
+          cell.value = val === null ? null : String(val);
         }
       });
-
       row.commit();
       r++;
     });
 
     const detFirstDataRow = HEADER_ROW_INDEX + 1;
     const detLast = r - 1;
-
     if (detLast >= detFirstDataRow) {
-      // Borders for visible region
       addBorders(wsDET, detFirstDataRow, detLast, 1, DET_HEADERS.length);
 
-      // Totals row (visible): show formatted text with semicolons for J..P;
-      // also write numeric totals into hidden helper cells.
-      const totalsRowIdx = detLast + 1;
-      const totalsRow = wsDET.getRow(totalsRowIdx);
+      // Totals row: keep your previous summed columns J..M
+      const j = DET_HEADERS.indexOf("I alt, kr") + 1;
+      const k = DET_HEADERS.indexOf("Saltning, kr") + 1;
+      const l = DET_HEADERS.indexOf("Salt, antal") + 1;
+      const m = DET_HEADERS.indexOf("Salt, gns. pris") + 1;
+      const detTotalsRow = detLast + 1;
+      const colsToSum = [j, k, l, m].filter(Boolean);
+      if (colsToSum.length) writeSumFormulas(wsDET, detTotalsRow, colsToSum, detFirstDataRow, detLast);
 
-      visibleJPHeaders.forEach(hdr => {
-        const visCol = headerToIndex[hdr];
-        const helperCol = headerToIndex[`${HELPER_LABEL_PREFIX}${hdr}`];
-        const dec = decimalsForHeader(hdr);
+      // Make sure visible totals use correct formats too
+      if (j) wsDET.getCell(detTotalsRow, j).numFmt = "#,##0.000";
+      if (k) wsDET.getCell(detTotalsRow, k).numFmt = "#,##0.000";
+      if (l) wsDET.getCell(detTotalsRow, l).numFmt = "0";
+      if (m) wsDET.getCell(detTotalsRow, m).numFmt = "#,##0.000";
 
-        // Numeric total (computed in code)
-        const totalNum = runningTotals[hdr] || 0;
-
-        // Visible text total with semicolons
-        totalsRow.getCell(visCol).value = formatWithSemicolons(totalNum, dec);
-
-        // Hidden helper numeric total
-        if (helperCol) {
-          totalsRow.getCell(helperCol).value = totalNum;
-          totalsRow.getCell(helperCol).numFmt = dec === 0 ? "0" : "#,##0.000";
-        }
-      });
-
-      // Draw a border across the visible columns up to P
-      const lastVisibleCol = headerToIndex["Kombi, gns. pris"] || DET_HEADERS.length;
-      addBorders(wsDET, totalsRowIdx, totalsRowIdx, 1, lastVisibleCol);
-
-      writeFooter(wsDET, 1, 3, totalsRowIdx, extracted_at || todayDk());
+      writeFooter(wsDET, 1, 3, detTotalsRow, footerDate);
     } else {
-      writeFooter(wsDET, 1, 3, HEADER_ROW_INDEX, extracted_at || todayDk());
+      writeFooter(wsDET, 1, 3, HEADER_ROW_INDEX, footerDate);
     }
 
     /* -------- SAP (second tab) -------- */
@@ -410,6 +372,7 @@ module.exports = async (req, res) => {
 
         if (typeof val === "number") {
           cell.value = Number(val);
+          // Prices keep two decimals
           if (/moms/i.test(hdr)) cell.numFmt = "#,##0.00";
           else cell.numFmt = "0";
         } else {
@@ -426,16 +389,10 @@ module.exports = async (req, res) => {
       addBorders(wsSAP, sapFirstDataRow, sapLast, 1, SAP_HEADERS.length);
       const h = SAP_HEADERS.indexOf("Pris ex. moms") + 1;
       const sapTotalsRow = sapLast + 1;
-      if (h) {
-        // Keep numeric SUM in SAP as before
-        const colLetter = numberToColumn(h);
-        const c = wsSAP.getCell(sapTotalsRow, h);
-        c.value = { formula: `SUM(${colLetter}${sapFirstDataRow}:${colLetter}${sapLast})` };
-        c.font = { bold: true };
-      }
-      writeFooter(wsSAP, 1, 3, sapTotalsRow, extracted_at || todayDk());
+      if (h) writeSumFormulas(wsSAP, sapTotalsRow, [h], sapFirstDataRow, sapLast);
+      writeFooter(wsSAP, 1, 3, sapTotalsRow, footerDate);
     } else {
-      writeFooter(wsSAP, 1, 3, HEADER_ROW_INDEX, extracted_at || todayDk());
+      writeFooter(wsSAP, 1, 3, HEADER_ROW_INDEX, footerDate);
     }
 
     // Return file
