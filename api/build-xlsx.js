@@ -29,9 +29,9 @@ async function readCsvText({ url, csv, headers }) {
 const SHEET_DET = "Detaljeret oversigt";
 const SHEET_SAP = "SAP";
 
-const TITLE_ROW_INDEX    = 1; // Periode… (merged)
-const SUBTITLE_ROW_INDEX = 2; // optional (merged)
-const BLANK_ROW_INDEX    = 3; // reserved
+const TITLE_ROW_INDEX    = 1;
+const SUBTITLE_ROW_INDEX = 2;
+const BLANK_ROW_INDEX    = 3;
 const HEADER_ROW_INDEX   = 4;
 
 const BORDER = { style: "thin", color: { argb: "FF000000" } };
@@ -66,20 +66,62 @@ const SAP_NUMERIC_HEADERS = new Set([
   "Pris inkl. moms","Pris ex. moms"
 ]);
 
-/* Danish/intl-friendly number parsing */
+/* Robust number parsing.
+   Rules (in order):
+   - EU with decimal comma MUST have a comma, e.g. 1.234,56  -> 1234.56
+   - US grouping + dot decimal, e.g. 1,234.56               -> 1234.56
+   - Plain comma decimal, e.g. 1234,56                      -> 1234.56
+   - Plain dot decimal, e.g. 570.843                        -> 570.843   (THIS FIX)
+   - Pure thousands with dots only, e.g. 1.234.567          -> 1234567
+   - Plain integers                                          -> as-is
+*/
 function toNumberMaybe(v) {
   if (v === null || v === undefined) return null;
   if (typeof v === "number") return Number.isFinite(v) ? v : null;
+
   let s = String(v).trim();
   if (!s) return null;
-
   s = s.replace(/\s+/g, "");
-  // 1.234,56 -> 1234.56
-  if (/^\d{1,3}(\.\d{3})*(,\d+)?$/.test(s)) s = s.replace(/\./g, "").replace(",", ".");
-  // 1234,56 -> 1234.56
-  else if (/^\d+,\d+$/.test(s)) s = s.replace(",", ".");
-  // 1,234,567.89 -> 1234567.89
-  if (/^\d{1,3}(,\d{3})+(\.\d+)?$/.test(s)) s = s.replace(/,/g, "");
+
+  // EU style with comma decimal (must contain a comma)
+  if (/,/.test(s) && /^\d{1,3}(\.\d{3})*(,\d+)?$/.test(s)) {
+    s = s.replace(/\./g, "").replace(",", ".");
+    const n = Number(s);
+    return Number.isFinite(n) ? n : null;
+  }
+
+  // US style with comma thousands and dot decimal
+  if (/^\d{1,3}(,\d{3})+(\.\d+)?$/.test(s)) {
+    s = s.replace(/,/g, "");
+    const n = Number(s);
+    return Number.isFinite(n) ? n : null;
+  }
+
+  // Plain comma decimal
+  if (/^\d+,\d+$/.test(s)) {
+    s = s.replace(",", ".");
+    const n = Number(s);
+    return Number.isFinite(n) ? n : null;
+  }
+
+  // Plain dot decimal (e.g. 570.843)  <-- prevents stripping the decimal dot
+  if (/^\d+\.\d+$/.test(s)) {
+    const n = Number(s);
+    return Number.isFinite(n) ? n : null;
+  }
+
+  // Thousands with dots only (no comma), e.g. 1.234.567
+  if (!/,/.test(s) && /^\d{1,3}(\.\d{3})+$/.test(s)) {
+    s = s.replace(/\./g, "");
+    const n = Number(s);
+    return Number.isFinite(n) ? n : null;
+  }
+
+  // Plain integer
+  if (/^\d+$/.test(s)) {
+    const n = Number(s);
+    return Number.isFinite(n) ? n : null;
+  }
 
   const n = Number(s);
   return Number.isFinite(n) ? n : null;
@@ -172,7 +214,6 @@ function writeSumFormulas(ws, totalRow, colIndexes, startRow, endRow) {
   }
 }
 
-/* Loose header lookup (case/commas) */
 function getValueForHeader(obj, hdr) {
   if (obj[hdr] !== undefined) return obj[hdr];
   const target = stripComma(hdr);
@@ -210,7 +251,6 @@ function isNoiseRow(arr) {
 
 function parseCsvFlexible(text, expectedHeaders) {
   const clean = (text || "").replace(/^\uFEFF/, "");
-
   const candidates = [";", ",", "\t"];
   let best = { rows: [], headerIdx: -1, score: -1, delimiter: ";" };
   for (const d of candidates) {
@@ -219,14 +259,12 @@ function parseCsvFlexible(text, expectedHeaders) {
   }
   const rows = best.rows;
 
-  // Title in first row if "Periode…"
   let title = "";
   const t0 = (rows[0]?.[0] || "").toString().replace(/^"+|"+$/g, "");
   if (norm(t0).startsWith("periode")) title = t0;
 
   const headerIdx = best.headerIdx >= 0 ? best.headerIdx : 0;
 
-  // Subtitle: first non-empty line between title and header
   let subtitle = "";
   for (let i = 1; i < headerIdx; i++) {
     const line = rows[i] || [];
@@ -234,7 +272,6 @@ function parseCsvFlexible(text, expectedHeaders) {
     if (pieces.length) { subtitle = pieces.join("  "); break; }
   }
 
-  // Headers & data (NO heuristic dropping)
   const headers = (rows[headerIdx] || []).map(x => (x ?? "").toString().trim());
   const data = [];
   for (let i = headerIdx + 1; i < rows.length; i++) {
@@ -296,6 +333,10 @@ module.exports = async (req, res) => {
 
     writeHeader(wsDET, DET_HEADERS);
 
+    // Formatting: counts 0 decimals; money/avg 3 decimals; fallback 3
+    const decimalsForHeader = hdr =>
+      (/antal|kg/i.test(hdr) ? 0 : 3);
+
     let r = HEADER_ROW_INDEX + 1;
     detParsed.rows.forEach(obj => {
       const row = wsDET.getRow(r);
@@ -305,25 +346,16 @@ module.exports = async (req, res) => {
         const cell = row.getCell(i + 1);
 
         if (/^\d{1,2}$/.test(hdr)) {
-          // Day columns: keep as text (K/S markers, etc.)
+          // Day columns: text (K/S)
           cell.value = val === null ? null : String(val);
           cell.numFmt = "General";
         } else if (typeof val === "number") {
-          // Numeric columns: keep numeric; format by type
+          // Numeric
           cell.value = Number(val);
-
-          // ——— Formatting rules (J→P are covered by these headers) ———
-          // Any header ending with ', kr' or containing 'gns. pris' => 3 decimals
-          // Counts/weights ('antal', 'kg') => 0 decimals
-          if (/, kr$/i.test(hdr) || /gns\. pris/i.test(hdr)) {
-            cell.numFmt = "#,##0.000";
-          } else if (/antal|kg/i.test(hdr)) {
-            cell.numFmt = "0";
-          } else {
-            cell.numFmt = "#,##0.000"; // fallback: 3 decimals to match your example
-          }
+          const dec = decimalsForHeader(hdr);
+          cell.numFmt = dec === 0 ? "0" : "#,##0.000"; // comma thousands, dot decimals
         } else {
-          // Text columns
+          // Text
           cell.value = val === null ? null : String(val);
         }
       });
@@ -336,7 +368,7 @@ module.exports = async (req, res) => {
     if (detLast >= detFirstDataRow) {
       addBorders(wsDET, detFirstDataRow, detLast, 1, DET_HEADERS.length);
 
-      // Totals row: keep your previous summed columns J..M
+      // Totals for J..M (as before)
       const j = DET_HEADERS.indexOf("I alt, kr") + 1;
       const k = DET_HEADERS.indexOf("Saltning, kr") + 1;
       const l = DET_HEADERS.indexOf("Salt, antal") + 1;
@@ -345,7 +377,7 @@ module.exports = async (req, res) => {
       const colsToSum = [j, k, l, m].filter(Boolean);
       if (colsToSum.length) writeSumFormulas(wsDET, detTotalsRow, colsToSum, detFirstDataRow, detLast);
 
-      // Make sure visible totals use correct formats too
+      // Ensure total row formats match
       if (j) wsDET.getCell(detTotalsRow, j).numFmt = "#,##0.000";
       if (k) wsDET.getCell(detTotalsRow, k).numFmt = "#,##0.000";
       if (l) wsDET.getCell(detTotalsRow, l).numFmt = "0";
@@ -372,7 +404,6 @@ module.exports = async (req, res) => {
 
         if (typeof val === "number") {
           cell.value = Number(val);
-          // Prices keep two decimals
           if (/moms/i.test(hdr)) cell.numFmt = "#,##0.00";
           else cell.numFmt = "0";
         } else {
