@@ -31,7 +31,6 @@ const SHEET_SAP = "SAP";
 
 const TITLE_ROW_INDEX    = 1; // Periode…
 const SUBTITLE_ROW_INDEX = 2; // long supplier list
-const BLANK_ROW_INDEX    = 3; // (unused but reserved)
 const HEADER_ROW_INDEX   = 4;
 
 const BORDER = { style: "thin", color: { argb: "FF000000" } };
@@ -55,39 +54,113 @@ const DET_BASE_WIDTHS = [
 ];
 const DAY_COL_WIDTH = 3.0;
 
-/* -------------------- Numeric coercion -------------------- */
-const DET_NUMERIC_HEADERS = new Set([
-  "I alt, kr","Saltning, kr","Salt, antal","Salt, gns. pris",
-  "Kombi, kr","Kombi, antal","Kombi, gns. pris",
-  "Snerydning, kr","Sne, antal","Sne, gns. pris",
-  "Andet, kr","Andet, antal","Andet, gns. pris","Salt, kg"
-]);
-const SAP_NUMERIC_HEADERS = new Set([
+/* -------------------- Column typing helpers -------------------- */
+const MONEY_HEADERS = new Set([
+  "I alt, kr","Saltning, kr","Kombi, kr","Snerydning, kr","Andet, kr",
   "Pris inkl. moms","Pris ex. moms"
 ]);
 
-function toNumberMaybe(v) {
-  if (v === null || v === undefined) return null;
-  if (typeof v === "number") return v;
-  let s = String(v).trim();
+const AVG_PRICE_HEADERS = new Set([
+  "Salt, gns. pris","Kombi, gns. pris","Sne, gns. pris","Andet, gns. pris"
+]);
+
+const COUNT_HEADERS = new Set([
+  "Salt, antal","Kombi, antal","Sne, antal","Andet, antal","Salt, kg"
+]);
+
+/* -------------------- Number parsing with format inference --------------------
+   We return { num, fmt, decimals, groupingUsed } so we can apply the same “look”
+   in Excel that the source text implied.
+----------------------------------------------------------------------------- */
+function parseNumberAndFormat(rawText) {
+  if (rawText === null || rawText === undefined) return null;
+  let s = String(rawText).trim();
   if (!s) return null;
-  s = s.replace(/\s+/g, "");
-  if (/^\d{1,3}(\.\d{3})*(,\d+)?$/.test(s)) s = s.replace(/\./g, "").replace(",", ".");
-  else if (/^\d+,\d+$/.test(s)) s = s.replace(",", ".");
-  if (/^\d{1,3}(,\d{3})+$/.test(s)) s = s.replace(/,/g, "");
-  const n = Number(s);
-  return Number.isFinite(n) ? n : null;
+
+  // normalize thin spaces and NBSP
+  s = s.replace(/\u00A0|\u2009/g, "");
+
+  const hasDot = s.includes(".");
+  const hasComma = s.includes(",");
+  let decimals = 0;
+  let groupingUsed = false;
+  let num = null;
+  let fmt = null;
+
+  const decFmt = d => (d > 0 ? "0." + "0".repeat(d) : "0");
+  const decFmtGrouped = d => (d > 0 ? "#,##0." + "0".repeat(d) : "#,##0");
+
+  // Case: both separators present -> detect common European "1.234,56"
+  if (hasDot && hasComma) {
+    const lastComma = s.lastIndexOf(",");
+    const tail = s.slice(lastComma + 1);
+    // Treat "." as thousands, "," as decimal: 1.234,567
+    const noDots = s.replace(/\./g, "");
+    const canonical = noDots.replace(",", ".");
+    num = Number(canonical);
+    if (!Number.isFinite(num)) return null;
+    decimals = /^\d+$/.test(tail) ? tail.length : 0;
+    groupingUsed = true;
+    fmt = decFmtGrouped(decimals);
+    return { num, fmt, decimals, groupingUsed };
+  }
+
+  // Only comma present
+  if (hasComma && !hasDot) {
+    const parts = s.split(",");
+    const tail = parts[1] || "";
+    // Ambiguity: 570,843 could be 570.843 (decimal) or 570,843 (thousands)
+    // Heuristic: if there is ONLY one comma and the tail has 1–3 digits, treat as decimal.
+    if (parts.length === 2 && /^\d{1,3}$/.test(tail)) {
+      // decimal comma
+      decimals = tail.length;
+      num = Number(parts[0] + "." + tail);
+      if (!Number.isFinite(num)) return null;
+      groupingUsed = false;                // pure decimal form -> no thousands in fmt
+      fmt = decFmt(decimals);
+      return { num, fmt, decimals, groupingUsed };
+    }
+    // Otherwise treat comma as thousands separator
+    num = Number(s.replace(/,/g, ""));
+    if (!Number.isFinite(num)) return null;
+    decimals = 0;
+    groupingUsed = true;
+    fmt = decFmtGrouped(0);
+    return { num, fmt, decimals, groupingUsed };
+  }
+
+  // Only dot present
+  if (!hasComma && hasDot) {
+    // If exactly one dot and 1–3 digits after -> decimal dot, no grouping
+    const dotParts = s.split(".");
+    if (dotParts.length === 2 && /^\d{1,3}$/.test(dotParts[1])) {
+      decimals = dotParts[1].length;
+      num = Number(s);
+      if (!Number.isFinite(num)) return null;
+      groupingUsed = false;
+      fmt = decFmt(decimals);
+      return { num, fmt, decimals, groupingUsed };
+    }
+    // Multiple dots or unclear -> strip grouping and keep decimals of last segment
+    const cleaned = s.replace(/\./g, "");
+    num = Number(cleaned);
+    if (!Number.isFinite(num)) return null;
+    decimals = 0;
+    groupingUsed = true;
+    fmt = decFmtGrouped(0);
+    return { num, fmt, decimals, groupingUsed };
+  }
+
+  // No separator -> integer
+  num = Number(s);
+  if (!Number.isFinite(num)) return null;
+  decimals = 0;
+  groupingUsed = false;
+  fmt = "0";
+  return { num, fmt, decimals, groupingUsed };
 }
 
-/* Keep day columns (1–31) as text; coerce only known numeric fields */
-function coerceByHeader(header, value) {
-  const h = (header || "").trim();
-  if (/^\d{1,2}$/.test(h)) return value === "" ? null : value; // day columns -> text (K/S)
-  if (DET_NUMERIC_HEADERS.has(h) || SAP_NUMERIC_HEADERS.has(h)) return toNumberMaybe(value);
-  return value === "" ? null : value;
-}
-
-/* -------------------- Helpers -------------------- */
+/* -------------------- Utilities -------------------- */
 const norm = s => (s ?? "").toString().trim().toLowerCase();
 const stripComma = s => norm(s).replace(/,/g, "");
 
@@ -193,7 +266,6 @@ function parseWithDelimiter(raw, delimiter, expectedHeaders) {
   return { rows, headerIdx: idx, score };
 }
 
-/* Only skip fully empty rows and explicit "Udtrukket..." meta rows */
 function isNoiseRow(arr) {
   const first = (arr[0] ?? "").toString().trim().toLowerCase();
   const allEmpty = arr.every(v => (v ?? "").toString().trim() === "");
@@ -207,7 +279,7 @@ function parseCsvFlexible(text, expectedHeaders, opts = {}) {
   const { identityKeys = [], valueKeys = [], dayKeys = [] } = opts;
   const clean = (text || "").replace(/^\uFEFF/, "");
 
-  // Try multiple delimiters and pick the one with the best header match score
+  // Try multiple delimiters and pick best
   const candidates = [";", ",", "\t"];
   let best = { rows: [], headerIdx: -1, score: -1, delimiter: ";" };
   for (const d of candidates) {
@@ -291,13 +363,13 @@ module.exports = async (req, res) => {
       valueKeys: [
         "I alt, kr","Saltning, kr","Salt, antal","Salt, gns. pris",
         "Kombi, kr","Kombi, antal","Kombi, gns. pris",
-        "Snerydning, kr","Sne, antal",
+        "Snerydning, kr","Sne, antal","Sne, gns. pris",
         "Andet, kr","Andet, antal","Salt, kg",
       ],
       dayKeys: detDaysAll,
     });
 
-    // Dynamic day columns present
+    // Dynamic day columns
     const detDays = detParsed.headers.map(h => (h || "").trim()).filter(h => /^\d{1,2}$/.test(h));
     const DET_HEADERS = [...DET_BASE_HEADERS, ...detDays];
     const DET_WIDTHS  = [...DET_BASE_WIDTHS, ...new Array(detDays.length).fill(DAY_COL_WIDTH)];
@@ -310,45 +382,99 @@ module.exports = async (req, res) => {
     const wsDET = wb.addWorksheet(SHEET_DET);
     wsDET.columns = DET_WIDTHS.map(w => ({ width: w }));
     setTitle(wsDET, detParsed.title || sapParsed.title || "", DET_HEADERS.length);
-
-    // Prefer the Detaljeret subtitle; if absent, use SAP’s
-    const subtitleText = detParsed.subtitle || sapParsed.subtitle || "";
-    setSubtitle(wsDET, subtitleText, DET_HEADERS.length);
-
+    setSubtitle(wsDET, detParsed.subtitle || sapParsed.subtitle || "", DET_HEADERS.length);
     writeHeader(wsDET, DET_HEADERS);
+
+    // Track per-column decimal precision & whether grouping was used at least once
+    const detDecimalsByHeader = Object.create(null);  // max decimals seen
+    const detGroupingByHeader = Object.create(null);  // any grouping used
 
     let r = HEADER_ROW_INDEX + 1;
     detParsed.rows.forEach(obj => {
       const row = wsDET.getRow(r);
       DET_HEADERS.forEach((hdr, i) => {
         const raw = getValueForHeader(obj, hdr);
-        const val = coerceByHeader(hdr, raw);
         const cell = row.getCell(i + 1);
 
-        if (/^\d{1,2}$/.test(hdr)) {           // day columns
-          cell.value = val === "" ? null : val;
+        // Day columns stay as text (K/S)
+        if (/^\d{1,2}$/.test(hdr)) {
+          cell.value = (raw === "" || raw === null) ? null : raw;
           cell.numFmt = "General";
-        } else if (typeof val === "number") {  // numeric
-          cell.value = Number(val);
-          if (/antal|kg/.test(hdr.toLowerCase())) cell.numFmt = "0";
-          else cell.numFmt = "#,##0.00";
-        } else {                               // text
-          cell.value = val === "" ? null : val;
+          return;
         }
+
+        // Counts stay numeric integers where possible
+        if (COUNT_HEADERS.has(hdr)) {
+          const parsed = parseNumberAndFormat(raw);
+          if (parsed) {
+            cell.value = parsed.num;
+            // For counts, show integer unless source had decimals
+            const zeros = parsed.decimals > 0 ? "0." + "0".repeat(parsed.decimals) : "0";
+            cell.numFmt = zeros;
+            detDecimalsByHeader[hdr] = Math.max(detDecimalsByHeader[hdr] || 0, parsed.decimals);
+          } else {
+            cell.value = (raw === "" || raw === null) ? null : raw;
+          }
+          return;
+        }
+
+        // Money & average price columns -> numeric with inferred decimals
+        if (MONEY_HEADERS.has(hdr) || AVG_PRICE_HEADERS.has(hdr)) {
+          const parsed = parseNumberAndFormat(raw);
+          if (parsed) {
+            cell.value = parsed.num;
+            // If source looked like pure decimal (no grouping), keep no-group fmt; else allow grouping
+            // Money columns usually grouped; but if the source was clearly a pure decimal like 570,843, keep it as 0.000
+            cell.numFmt = parsed.fmt;
+            detDecimalsByHeader[hdr] = Math.max(detDecimalsByHeader[hdr] || 0, parsed.decimals);
+            if (parsed.groupingUsed) detGroupingByHeader[hdr] = true;
+          } else {
+            cell.value = (raw === "" || raw === null) ? null : raw;
+          }
+          return;
+        }
+
+        // Other text
+        cell.value = (raw === "" || raw === null) ? null : raw;
       });
       row.commit();
       r++;
     });
     const detLast = r - 1;
+
     if (detLast >= HEADER_ROW_INDEX + 1) {
       addBorders(wsDET, HEADER_ROW_INDEX + 1, detLast, 1, DET_HEADERS.length);
-      const j = DET_HEADERS.indexOf("I alt, kr") + 1;
-      const k = DET_HEADERS.indexOf("Saltning, kr") + 1;
-      const l = DET_HEADERS.indexOf("Salt, antal") + 1;
-      const m = DET_HEADERS.indexOf("Salt, gns. pris") + 1;
+
+      // Totals row for a few key columns (same as before)
+      const colIndex = name => DET_HEADERS.indexOf(name) + 1;
+      const j = colIndex("I alt, kr");
+      const k = colIndex("Saltning, kr");
+      const l = colIndex("Salt, antal");
+      const m = colIndex("Salt, gns. pris");
       const detTotalsRow = detLast + 1;
       const colsToSum = [j, k, l, m].filter(Boolean);
       if (colsToSum.length) writeSumFormulas(wsDET, detTotalsRow, colsToSum, HEADER_ROW_INDEX + 1, detLast);
+
+      // Apply formats to totals based on column stats (max decimals seen; grouping if seen)
+      const applyTotalFmt = (hdr, colIdx) => {
+        if (!colIdx) return;
+        const d = detDecimalsByHeader[hdr] || 0;
+        const grouping = !!detGroupingByHeader[hdr];
+        let fmt;
+        if (grouping || MONEY_HEADERS.has(hdr)) {
+          // group when any source used grouping, or when hdr is a money column and decimals suggest currency
+          fmt = (d > 0) ? "#,##0." + "0".repeat(d) : "#,##0";
+        } else {
+          fmt = (d > 0) ? "0." + "0".repeat(d) : "0";
+        }
+        wsDET.getCell(detTotalsRow, colIdx).numFmt = fmt;
+      };
+
+      applyTotalFmt("I alt, kr", j);
+      applyTotalFmt("Saltning, kr", k);
+      applyTotalFmt("Salt, antal", l);
+      applyTotalFmt("Salt, gns. pris", m);
+
       writeFooter(wsDET, 1, 3, detTotalsRow, footerDate);
     } else {
       writeFooter(wsDET, 1, 3, HEADER_ROW_INDEX, footerDate);
@@ -360,31 +486,60 @@ module.exports = async (req, res) => {
     setTitle(wsSAP, sapParsed.title || detParsed.title || "", SAP_HEADERS.length);
     writeHeader(wsSAP, SAP_HEADERS);
 
+    const sapDecimalsByHeader = Object.create(null);
+    const sapGroupingByHeader = Object.create(null);
+
     r = HEADER_ROW_INDEX + 1;
     sapParsed.rows.forEach(obj => {
       const row = wsSAP.getRow(r);
       SAP_HEADERS.forEach((hdr, i) => {
         const raw = getValueForHeader(obj, hdr);
-        const val = coerceByHeader(hdr, raw);
         const cell = row.getCell(i + 1);
 
-        if (typeof val === "number") {
-          cell.value = Number(val);
-          if (/moms/.test(hdr.toLowerCase())) cell.numFmt = "#,##0.00";
-          else cell.numFmt = "0";
+        if (MONEY_HEADERS.has(hdr)) {
+          const parsed = parseNumberAndFormat(raw);
+          if (parsed) {
+            cell.value = parsed.num;
+            cell.numFmt = parsed.fmt;
+            sapDecimalsByHeader[hdr] = Math.max(sapDecimalsByHeader[hdr] || 0, parsed.decimals);
+            if (parsed.groupingUsed) sapGroupingByHeader[hdr] = true;
+          } else {
+            cell.value = (raw === "" || raw === null) ? null : raw;
+          }
+          return;
+        }
+
+        // Other fields: try numeric-inference; else text
+        const parsed = parseNumberAndFormat(raw);
+        if (parsed) {
+          cell.value = parsed.num;
+          cell.numFmt = parsed.fmt;
+          sapDecimalsByHeader[hdr] = Math.max(sapDecimalsByHeader[hdr] || 0, parsed.decimals);
+          if (parsed.groupingUsed) sapGroupingByHeader[hdr] = true;
         } else {
-          cell.value = val === "" ? null : val;
+          cell.value = (raw === "" || raw === null) ? null : raw;
         }
       });
       row.commit();
       r++;
     });
     const sapLast = r - 1;
+
     if (sapLast >= HEADER_ROW_INDEX + 1) {
       addBorders(wsSAP, HEADER_ROW_INDEX + 1, sapLast, 1, SAP_HEADERS.length);
-      const h = SAP_HEADERS.indexOf("Pris ex. moms") + 1;
+
+      // Example total for Pris ex. moms
+      const hIdx = SAP_HEADERS.indexOf("Pris ex. moms") + 1;
       const sapTotalsRow = sapLast + 1;
-      if (h) writeSumFormulas(wsSAP, sapTotalsRow, [h], HEADER_ROW_INDEX + 1, sapLast);
+      if (hIdx) {
+        writeSumFormulas(wsSAP, sapTotalsRow, [hIdx], HEADER_ROW_INDEX + 1, sapLast);
+        const d = sapDecimalsByHeader["Pris ex. moms"] || 2;
+        const grouping = !!sapGroupingByHeader["Pris ex. moms"];
+        wsSAP.getCell(sapTotalsRow, hIdx).numFmt = grouping
+          ? "#,##0." + "0".repeat(d)
+          : "0." + "0".repeat(d);
+      }
+
       writeFooter(wsSAP, 1, 3, sapTotalsRow, footerDate);
     } else {
       writeFooter(wsSAP, 1, 3, HEADER_ROW_INDEX, footerDate);
