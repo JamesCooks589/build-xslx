@@ -68,9 +68,10 @@ const COUNT_HEADERS = new Set([
   "Salt, antal","Kombi, antal","Sne, antal","Andet, antal","Salt, kg"
 ]);
 
-/* -------------------- Number parsing with format inference --------------------
-   We return { num, fmt, decimals, groupingUsed } so we can apply the same “look”
-   in Excel that the source text implied.
+/* -------------------- Number parsing with ; grouping --------------------
+   - Treat ';' as thousands/grouping separator (never decimal).
+   - Support '.' or ',' as decimals where applicable.
+   - Return { num, fmt, decimals, groupingUsed } so we can format the Excel cell.
 ----------------------------------------------------------------------------- */
 function parseNumberAndFormat(rawText) {
   if (rawText === null || rawText === undefined) return null;
@@ -80,25 +81,43 @@ function parseNumberAndFormat(rawText) {
   // normalize thin spaces and NBSP
   s = s.replace(/\u00A0|\u2009/g, "");
 
+  // Detect semicolon grouping (your data uses ";" for thousands)
+  const hadSemicolonGrouping = s.includes(";");
+  if (hadSemicolonGrouping) {
+    s = s.replace(/;/g, ""); // remove grouping to parse numerically
+  }
+
   const hasDot = s.includes(".");
   const hasComma = s.includes(",");
   let decimals = 0;
-  let groupingUsed = false;
+  let groupingUsed = hadSemicolonGrouping; // true if we saw any ';'
   let num = null;
   let fmt = null;
 
   const decFmt = d => (d > 0 ? "0." + "0".repeat(d) : "0");
   const decFmtGrouped = d => (d > 0 ? "#,##0." + "0".repeat(d) : "#,##0");
 
-  // Case: both separators present -> detect common European "1.234,56"
+  // Case: both '.' and ',' present -> decide decimal
   if (hasDot && hasComma) {
+    const lastDot = s.lastIndexOf(".");
     const lastComma = s.lastIndexOf(",");
-    const tail = s.slice(lastComma + 1);
-    // Treat "." as thousands, "," as decimal: 1.234,567
-    const noDots = s.replace(/\./g, "");
-    const canonical = noDots.replace(",", ".");
-    num = Number(canonical);
+    // If comma is the last separator, treat comma as decimal (European "1.234,56").
+    if (lastComma > lastDot) {
+      const noDots = s.replace(/\./g, "");
+      const canonical = noDots.replace(",", ".");
+      num = Number(canonical);
+      if (!Number.isFinite(num)) return null;
+      const tail = s.slice(lastComma + 1);
+      decimals = /^\d+$/.test(tail) ? tail.length : 0;
+      groupingUsed = true; // dots were grouping
+      fmt = decFmtGrouped(decimals);
+      return { num, fmt, decimals, groupingUsed };
+    }
+    // Else dot is decimal (rare mix), treat comma as grouping
+    const noCommas = s.replace(/,/g, "");
+    num = Number(noCommas);
     if (!Number.isFinite(num)) return null;
+    const tail = s.slice(lastDot + 1);
     decimals = /^\d+$/.test(tail) ? tail.length : 0;
     groupingUsed = true;
     fmt = decFmtGrouped(decimals);
@@ -109,54 +128,49 @@ function parseNumberAndFormat(rawText) {
   if (hasComma && !hasDot) {
     const parts = s.split(",");
     const tail = parts[1] || "";
-    // Ambiguity: 570,843 could be 570.843 (decimal) or 570,843 (thousands)
-    // Heuristic: if there is ONLY one comma and the tail has 1–3 digits, treat as decimal.
     if (parts.length === 2 && /^\d{1,3}$/.test(tail)) {
       // decimal comma
       decimals = tail.length;
       num = Number(parts[0] + "." + tail);
       if (!Number.isFinite(num)) return null;
-      groupingUsed = false;                // pure decimal form -> no thousands in fmt
-      fmt = decFmt(decimals);
+      fmt = groupingUsed ? decFmtGrouped(decimals) : decFmt(decimals);
       return { num, fmt, decimals, groupingUsed };
     }
-    // Otherwise treat comma as thousands separator
+    // otherwise treat comma as grouping
     num = Number(s.replace(/,/g, ""));
     if (!Number.isFinite(num)) return null;
     decimals = 0;
-    groupingUsed = true;
+    groupingUsed = true || groupingUsed;
     fmt = decFmtGrouped(0);
     return { num, fmt, decimals, groupingUsed };
   }
 
   // Only dot present
   if (!hasComma && hasDot) {
-    // If exactly one dot and 1–3 digits after -> decimal dot, no grouping
-    const dotParts = s.split(".");
-    if (dotParts.length === 2 && /^\d{1,3}$/.test(dotParts[1])) {
-      decimals = dotParts[1].length;
+    const parts = s.split(".");
+    const tail = parts[1] || "";
+    if (parts.length === 2 && /^\d{1,3}$/.test(tail)) {
+      // decimal dot
+      decimals = tail.length;
       num = Number(s);
       if (!Number.isFinite(num)) return null;
-      groupingUsed = false;
-      fmt = decFmt(decimals);
+      fmt = groupingUsed ? decFmtGrouped(decimals) : decFmt(decimals);
       return { num, fmt, decimals, groupingUsed };
     }
-    // Multiple dots or unclear -> strip grouping and keep decimals of last segment
-    const cleaned = s.replace(/\./g, "");
-    num = Number(cleaned);
+    // multiple dots or unclear -> strip grouping dots
+    num = Number(s.replace(/\./g, ""));
     if (!Number.isFinite(num)) return null;
     decimals = 0;
-    groupingUsed = true;
+    groupingUsed = true || groupingUsed;
     fmt = decFmtGrouped(0);
     return { num, fmt, decimals, groupingUsed };
   }
 
-  // No separator -> integer
+  // No dot or comma -> integer
   num = Number(s);
   if (!Number.isFinite(num)) return null;
   decimals = 0;
-  groupingUsed = false;
-  fmt = "0";
+  fmt = groupingUsed ? decFmtGrouped(0) : "0";
   return { num, fmt, decimals, groupingUsed };
 }
 
@@ -403,29 +417,28 @@ module.exports = async (req, res) => {
           return;
         }
 
-        // Counts stay numeric integers where possible
+        // Counts: numeric integers unless decimals present
         if (COUNT_HEADERS.has(hdr)) {
           const parsed = parseNumberAndFormat(raw);
           if (parsed) {
             cell.value = parsed.num;
-            // For counts, show integer unless source had decimals
             const zeros = parsed.decimals > 0 ? "0." + "0".repeat(parsed.decimals) : "0";
-            cell.numFmt = zeros;
+            // If groups present on counts (rare), allow grouping
+            cell.numFmt = parsed.groupingUsed ? (parsed.decimals ? "#,##0." + "0".repeat(parsed.decimals) : "#,##0") : zeros;
             detDecimalsByHeader[hdr] = Math.max(detDecimalsByHeader[hdr] || 0, parsed.decimals);
+            if (parsed.groupingUsed) detGroupingByHeader[hdr] = true;
           } else {
             cell.value = (raw === "" || raw === null) ? null : raw;
           }
           return;
         }
 
-        // Money & average price columns -> numeric with inferred decimals
+        // Money & avg price columns
         if (MONEY_HEADERS.has(hdr) || AVG_PRICE_HEADERS.has(hdr)) {
           const parsed = parseNumberAndFormat(raw);
           if (parsed) {
             cell.value = parsed.num;
-            // If source looked like pure decimal (no grouping), keep no-group fmt; else allow grouping
-            // Money columns usually grouped; but if the source was clearly a pure decimal like 570,843, keep it as 0.000
-            cell.numFmt = parsed.fmt;
+            cell.numFmt = parsed.fmt; // grouped vs non-grouped chosen by parser
             detDecimalsByHeader[hdr] = Math.max(detDecimalsByHeader[hdr] || 0, parsed.decimals);
             if (parsed.groupingUsed) detGroupingByHeader[hdr] = true;
           } else {
@@ -445,7 +458,7 @@ module.exports = async (req, res) => {
     if (detLast >= HEADER_ROW_INDEX + 1) {
       addBorders(wsDET, HEADER_ROW_INDEX + 1, detLast, 1, DET_HEADERS.length);
 
-      // Totals row for a few key columns (same as before)
+      // Totals row for a few key columns
       const colIndex = name => DET_HEADERS.indexOf(name) + 1;
       const j = colIndex("I alt, kr");
       const k = colIndex("Saltning, kr");
@@ -455,14 +468,13 @@ module.exports = async (req, res) => {
       const colsToSum = [j, k, l, m].filter(Boolean);
       if (colsToSum.length) writeSumFormulas(wsDET, detTotalsRow, colsToSum, HEADER_ROW_INDEX + 1, detLast);
 
-      // Apply formats to totals based on column stats (max decimals seen; grouping if seen)
+      // Format totals based on column stats (max decimals & whether grouping was used)
       const applyTotalFmt = (hdr, colIdx) => {
         if (!colIdx) return;
         const d = detDecimalsByHeader[hdr] || 0;
         const grouping = !!detGroupingByHeader[hdr];
         let fmt;
         if (grouping || MONEY_HEADERS.has(hdr)) {
-          // group when any source used grouping, or when hdr is a money column and decimals suggest currency
           fmt = (d > 0) ? "#,##0." + "0".repeat(d) : "#,##0";
         } else {
           fmt = (d > 0) ? "0." + "0".repeat(d) : "0";
@@ -496,7 +508,7 @@ module.exports = async (req, res) => {
         const raw = getValueForHeader(obj, hdr);
         const cell = row.getCell(i + 1);
 
-        if (MONEY_HEADERS.has(hdr)) {
+        if (MONEY_HEADERS.has(hdr) || AVG_PRICE_HEADERS.has(hdr)) {
           const parsed = parseNumberAndFormat(raw);
           if (parsed) {
             cell.value = parsed.num;
