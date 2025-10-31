@@ -29,13 +29,14 @@ async function readCsvText({ url, csv, headers }) {
 const SHEET_DET = "Detaljeret oversigt";
 const SHEET_SAP = "SAP";
 
-const TITLE_ROW_INDEX    = 1;
-const SUBTITLE_ROW_INDEX = 2;
-const BLANK_ROW_INDEX    = 3;
+const TITLE_ROW_INDEX    = 1; // Periode… (merged)
+const SUBTITLE_ROW_INDEX = 2; // optional (merged)
+const BLANK_ROW_INDEX    = 3; // reserved
 const HEADER_ROW_INDEX   = 4;
 
 const BORDER = { style: "thin", color: { argb: "FF000000" } };
 
+/* Headers/widths */
 const SAP_HEADERS = [
   "Kontrakt","Position","Artskonto","Besrkivelse","Profitcenter",
   "Pris inkl. moms","Momskode","Pris ex. moms","Lokation/rute","Kunde"
@@ -55,7 +56,7 @@ const DET_BASE_WIDTHS = [
 ];
 const DAY_COL_WIDTH = 3.0;
 
-/* -------------------- Numeric coercion -------------------- */
+/* Which Detaljeret headers are numeric */
 const DET_NUMERIC_HEADERS = new Set([
   "I alt, kr","Saltning, kr","Salt, antal","Salt, gns. pris",
   "Kombi, kr","Kombi, antal","Kombi, gns. pris",
@@ -66,31 +67,33 @@ const SAP_NUMERIC_HEADERS = new Set([
   "Pris inkl. moms","Pris ex. moms"
 ]);
 
-/* Robust number parsing.
-   Rules (in order):
-   - EU with decimal comma MUST have a comma, e.g. 1.234,56  -> 1234.56
-   - US grouping + dot decimal, e.g. 1,234.56               -> 1234.56
-   - Plain comma decimal, e.g. 1234,56                      -> 1234.56
-   - Plain dot decimal, e.g. 570.843                        -> 570.843   (THIS FIX)
-   - Pure thousands with dots only, e.g. 1.234.567          -> 1234567
-   - Plain integers                                          -> as-is
-*/
+/* -------------------- Robust number parsing --------------------
+   Goal: store EXACT numeric value from CSV; allow various user-entered styles.
+   - Strip spaces and semicolons (often used as group separators in exports).
+   - EU e.g. 1.234,56  -> 1234.56
+   - US e.g. 1,234.56  -> 1234.56
+   - Plain comma decimal  1234,56 -> 1234.56
+   - Plain dot decimal    570.843 -> 570.843
+   - Dot-grouped integer  1.234.567 -> 1234567
+----------------------------------------------------------------- */
 function toNumberMaybe(v) {
   if (v === null || v === undefined) return null;
   if (typeof v === "number") return Number.isFinite(v) ? v : null;
 
   let s = String(v).trim();
   if (!s) return null;
-  s = s.replace(/\s+/g, "");
 
-  // EU style with comma decimal (must contain a comma)
+  s = s.replace(/\s+/g, "");
+  s = s.replace(/;/g, ""); // drop semicolon groupings if present
+
+  // EU style with decimal comma (must contain comma)
   if (/,/.test(s) && /^\d{1,3}(\.\d{3})*(,\d+)?$/.test(s)) {
     s = s.replace(/\./g, "").replace(",", ".");
     const n = Number(s);
     return Number.isFinite(n) ? n : null;
   }
 
-  // US style with comma thousands and dot decimal
+  // US style with comma thousands and dot decimals
   if (/^\d{1,3}(,\d{3})+(\.\d+)?$/.test(s)) {
     s = s.replace(/,/g, "");
     const n = Number(s);
@@ -104,13 +107,13 @@ function toNumberMaybe(v) {
     return Number.isFinite(n) ? n : null;
   }
 
-  // Plain dot decimal (e.g. 570.843)  <-- prevents stripping the decimal dot
+  // Plain dot decimal
   if (/^\d+\.\d+$/.test(s)) {
     const n = Number(s);
     return Number.isFinite(n) ? n : null;
   }
 
-  // Thousands with dots only (no comma), e.g. 1.234.567
+  // Thousand groups with dots only
   if (!/,/.test(s) && /^\d{1,3}(\.\d{3})+$/.test(s)) {
     s = s.replace(/\./g, "");
     const n = Number(s);
@@ -251,6 +254,7 @@ function isNoiseRow(arr) {
 
 function parseCsvFlexible(text, expectedHeaders) {
   const clean = (text || "").replace(/^\uFEFF/, "");
+
   const candidates = [";", ",", "\t"];
   let best = { rows: [], headerIdx: -1, score: -1, delimiter: ";" };
   for (const d of candidates) {
@@ -259,12 +263,14 @@ function parseCsvFlexible(text, expectedHeaders) {
   }
   const rows = best.rows;
 
+  // Title row if "Periode…"
   let title = "";
   const t0 = (rows[0]?.[0] || "").toString().replace(/^"+|"+$/g, "");
   if (norm(t0).startsWith("periode")) title = t0;
 
   const headerIdx = best.headerIdx >= 0 ? best.headerIdx : 0;
 
+  // Subtitle: first non-empty between title and header
   let subtitle = "";
   for (let i = 1; i < headerIdx; i++) {
     const line = rows[i] || [];
@@ -272,6 +278,7 @@ function parseCsvFlexible(text, expectedHeaders) {
     if (pieces.length) { subtitle = pieces.join("  "); break; }
   }
 
+  // Headers & data (no heuristic filtering)
   const headers = (rows[headerIdx] || []).map(x => (x ?? "").toString().trim());
   const data = [];
   for (let i = headerIdx + 1; i < rows.length; i++) {
@@ -333,29 +340,28 @@ module.exports = async (req, res) => {
 
     writeHeader(wsDET, DET_HEADERS);
 
-    // Formatting: counts 0 decimals; money/avg 3 decimals; fallback 3
-    const decimalsForHeader = hdr =>
-      (/antal|kg/i.test(hdr) ? 0 : 3);
+    // Formatting rules: counts 0 decimals; money/avg 3 decimals; fallback 3
+    const decimalsForHeader = hdr => (/antal|kg/i.test(hdr) ? 0 : 3);
 
     let r = HEADER_ROW_INDEX + 1;
     detParsed.rows.forEach(obj => {
       const row = wsDET.getRow(r);
       DET_HEADERS.forEach((hdr, i) => {
         const raw = getValueForHeader(obj, hdr);
-        const val = coerceByHeader(hdr, raw);
+        const val = coerceByHeader(hdr, raw);  // <— PARSED NUMERIC or text straight from CSV
         const cell = row.getCell(i + 1);
 
         if (/^\d{1,2}$/.test(hdr)) {
-          // Day columns: text (K/S)
+          // Day columns: keep as text (K/S etc.)
           cell.value = val === null ? null : String(val);
           cell.numFmt = "General";
         } else if (typeof val === "number") {
-          // Numeric
+          // PURE number written; Excel formatting only (no string formatting)
           cell.value = Number(val);
           const dec = decimalsForHeader(hdr);
-          cell.numFmt = dec === 0 ? "0" : "#,##0.000"; // comma thousands, dot decimals
+          cell.numFmt = dec === 0 ? "0" : "#,##0.000"; // comma thousands + dot decimal
         } else {
-          // Text
+          // Text columns (IDs, names, addresses, etc.)
           cell.value = val === null ? null : String(val);
         }
       });
@@ -363,21 +369,22 @@ module.exports = async (req, res) => {
       r++;
     });
 
+    // Borders & totals
     const detFirstDataRow = HEADER_ROW_INDEX + 1;
     const detLast = r - 1;
     if (detLast >= detFirstDataRow) {
       addBorders(wsDET, detFirstDataRow, detLast, 1, DET_HEADERS.length);
 
-      // Totals for J..M (as before)
+      // Totals for J..M remain live formulas over numeric cells
       const j = DET_HEADERS.indexOf("I alt, kr") + 1;
-      const k = DET_HEADERS.indexOf("Saltning, kr") + 1;
+      const k = DET_HEADERS.indexOf("Saltning, kr") + 1;         // K column (e.g., 570.843)
       const l = DET_HEADERS.indexOf("Salt, antal") + 1;
       const m = DET_HEADERS.indexOf("Salt, gns. pris") + 1;
       const detTotalsRow = detLast + 1;
       const colsToSum = [j, k, l, m].filter(Boolean);
       if (colsToSum.length) writeSumFormulas(wsDET, detTotalsRow, colsToSum, detFirstDataRow, detLast);
 
-      // Ensure total row formats match
+      // Totals row display formats
       if (j) wsDET.getCell(detTotalsRow, j).numFmt = "#,##0.000";
       if (k) wsDET.getCell(detTotalsRow, k).numFmt = "#,##0.000";
       if (l) wsDET.getCell(detTotalsRow, l).numFmt = "0";
@@ -404,8 +411,7 @@ module.exports = async (req, res) => {
 
         if (typeof val === "number") {
           cell.value = Number(val);
-          if (/moms/i.test(hdr)) cell.numFmt = "#,##0.00";
-          else cell.numFmt = "0";
+          if (/moms/i.test(hdr)) cell.numFmt = "#,##0.00"; else cell.numFmt = "0";
         } else {
           cell.value = val === null ? null : String(val);
         }
