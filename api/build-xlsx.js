@@ -65,23 +65,45 @@ const SAP_NUMERIC_HEADERS = new Set([
   "Pris inkl. moms","Pris ex. moms"
 ]);
 
-/* -------------------- Number parsing -------------------- */
+/* -------------------- Robust number parsing -------------------- */
 function toNumberMaybe(v) {
-  if (v == null) return null;
+  if (v === null || v === undefined) return null;
   if (typeof v === "number") return Number.isFinite(v) ? v : null;
+
   let s = String(v).trim();
   if (!s) return null;
-  s = s.replace(/\s+/g, "").replace(/;/g, "");
 
-  if (/,/.test(s) && /^\d{1,3}(\.\d{3})*(,\d+)?$/.test(s))
+  s = s.replace(/\s+/g, "");
+  s = s.replace(/;/g, "");
+
+  if (/,/.test(s) && /^\d{1,3}(\.\d{3})*(,\d+)?$/.test(s)) {
     s = s.replace(/\./g, "").replace(",", ".");
-  else if (/^\d{1,3}(,\d{3})+(\.\d+)?$/.test(s))
+    const n = Number(s);
+    return Number.isFinite(n) ? n : null;
+  }
+  if (/^\d{1,3}(,\d{3})+(\.\d+)?$/.test(s)) {
     s = s.replace(/,/g, "");
-  else if (/^\d+,\d+$/.test(s))
+    const n = Number(s);
+    return Number.isFinite(n) ? n : null;
+  }
+  if (/^\d+,\d+$/.test(s)) {
     s = s.replace(",", ".");
-  else if (/^\d{1,3}(\.\d{3})+$/.test(s))
+    const n = Number(s);
+    return Number.isFinite(n) ? n : null;
+  }
+  if (/^\d+\.\d+$/.test(s)) {
+    const n = Number(s);
+    return Number.isFinite(n) ? n : null;
+  }
+  if (!/,/.test(s) && /^\d{1,3}(\.\d{3})+$/.test(s)) {
     s = s.replace(/\./g, "");
-
+    const n = Number(s);
+    return Number.isFinite(n) ? n : null;
+  }
+  if (/^\d+$/.test(s)) {
+    const n = Number(s);
+    return Number.isFinite(n) ? n : null;
+  }
   const n = Number(s);
   return Number.isFinite(n) ? n : null;
 }
@@ -179,14 +201,6 @@ function getValueForHeader(obj, hdr) {
   return k ? obj[k] : null;
 }
 
-/* -------------------- Parsing -------------------- */
-function parseCsvFlexible(text, expectedHeaders) {
-  const clean = (text || "").replace(/^\uFEFF/, "");
-  const parsed = Papa.parse(clean, { header: true, skipEmptyLines: true });
-  const headers = parsed.meta.fields || expectedHeaders;
-  return { title: "", subtitle: "", headers, rows: parsed.data };
-}
-
 /* ------------------------------ Handler ------------------------------ */
 module.exports = async (req, res) => {
   if (req.method !== "POST") {
@@ -197,18 +211,19 @@ module.exports = async (req, res) => {
   try {
     const body = typeof req.body === "string" ? JSON.parse(req.body || "{}") : (req.body || {});
     const {
-      sheet1_url, sheet1_csv, sheet2_url, sheet2_csv,
+      sheet1_url, sheet1_csv, sheet1_headers,
+      sheet2_url, sheet2_csv, sheet2_headers,
       extracted_at, file_name = "winter_fg.xlsx"
     } = body;
 
     const detDaysAll = Array.from({ length: 31 }, (_, i) => String(i + 1));
-    const sapText = await readCsvText({ url: sheet1_url, csv: sheet1_csv });
-    const detText = await readCsvText({ url: sheet2_url, csv: sheet2_csv });
+    const sapText = await readCsvText({ url: sheet1_url, csv: sheet1_csv, headers: sheet1_headers });
+    const detText = await readCsvText({ url: sheet2_url, csv: sheet2_csv, headers: sheet2_headers });
 
     const sapParsed = parseCsvFlexible(sapText, SAP_HEADERS);
     const detParsed = parseCsvFlexible(detText, [...DET_BASE_HEADERS, ...detDaysAll]);
 
-    const detDays = detParsed.headers.filter(h => /^\d{1,2}$/.test(h));
+    const detDays = detParsed.headers.map(h => (h || "").trim()).filter(h => /^\d{1,2}$/.test(h));
     const DET_HEADERS = [...DET_BASE_HEADERS, ...detDays];
     const DET_WIDTHS  = [...DET_BASE_WIDTHS, ...new Array(detDays.length).fill(DAY_COL_WIDTH)];
     const footerDate = extracted_at || todayDk();
@@ -219,6 +234,8 @@ module.exports = async (req, res) => {
     /* -------- Detaljeret oversigt -------- */
     const wsDET = wb.addWorksheet(SHEET_DET);
     wsDET.columns = DET_WIDTHS.map(w => ({ width: w }));
+    setTitle(wsDET, detParsed.title || sapParsed.title || "", DET_HEADERS.length);
+    setSubtitle(wsDET, detParsed.subtitle || sapParsed.subtitle || "", DET_HEADERS.length);
     writeHeader(wsDET, DET_HEADERS);
 
     const decimalsForHeader = hdr => (/antal|kg/i.test(hdr) ? 0 : 2);
@@ -233,9 +250,10 @@ module.exports = async (req, res) => {
 
         if (/^\d{1,2}$/.test(hdr)) {
           cell.value = val === null ? null : String(val);
+          cell.numFmt = "General";
         } else if (typeof val === "number") {
           const dec = decimalsForHeader(hdr);
-          cell.value = val;
+          cell.value = Number(val);
           cell.numFmt = dec === 0 ? "0" : "#,##0.00";
         } else {
           cell.value = val === null ? null : String(val);
@@ -245,23 +263,28 @@ module.exports = async (req, res) => {
       r++;
     });
 
-    const first = HEADER_ROW_INDEX + 1;
-    const last = r - 1;
-    if (last >= first) {
-      addBorders(wsDET, first, last, 1, DET_HEADERS.length);
+    const detFirst = HEADER_ROW_INDEX + 1;
+    const detLast = r - 1;
+    if (detLast >= detFirst) {
+      addBorders(wsDET, detFirst, detLast, 1, DET_HEADERS.length);
       const j = DET_HEADERS.indexOf("I alt, kr") + 1;
       const k = DET_HEADERS.indexOf("Saltning, kr") + 1;
       const l = DET_HEADERS.indexOf("Salt, antal") + 1;
       const m = DET_HEADERS.indexOf("Salt, gns. pris") + 1;
-      const totalRow = last + 1;
-      const colsToSum = [j, k, l, m].filter(Boolean);
-      if (colsToSum.length) writeSumFormulas(wsDET, totalRow, colsToSum, first, last);
+      const totalRow = detLast + 1;
+      const cols = [j, k, l, m].filter(Boolean);
+      if (cols.length) writeSumFormulas(wsDET, totalRow, cols, detFirst, detLast);
+      if (j) wsDET.getCell(totalRow, j).numFmt = "#,##0.00";
+      if (k) wsDET.getCell(totalRow, k).numFmt = "#,##0.00";
+      if (l) wsDET.getCell(totalRow, l).numFmt = "0";
+      if (m) wsDET.getCell(totalRow, m).numFmt = "#,##0.00";
       writeFooter(wsDET, 1, 3, totalRow, footerDate);
     }
 
     /* -------- SAP -------- */
     const wsSAP = wb.addWorksheet(SHEET_SAP);
     wsSAP.columns = SAP_WIDTHS.map(w => ({ width: w }));
+    setTitle(wsSAP, sapParsed.title || detParsed.title || "", SAP_HEADERS.length);
     writeHeader(wsSAP, SAP_HEADERS);
 
     r = HEADER_ROW_INDEX + 1;
@@ -271,9 +294,8 @@ module.exports = async (req, res) => {
         const raw = getValueForHeader(obj, hdr);
         const val = coerceByHeader(hdr, raw);
         const cell = row.getCell(i + 1);
-
         if (typeof val === "number") {
-          cell.value = val;
+          cell.value = Number(val);
           if (/moms/i.test(hdr)) cell.numFmt = "#,##0.00";
           else cell.numFmt = "0";
         } else {
