@@ -29,14 +29,13 @@ async function readCsvText({ url, csv, headers }) {
 const SHEET_DET = "Detaljeret oversigt";
 const SHEET_SAP = "SAP";
 
-const TITLE_ROW_INDEX    = 1; // Periode… (merged)
-const SUBTITLE_ROW_INDEX = 2; // optional (merged)
-const BLANK_ROW_INDEX    = 3; // reserved
+const TITLE_ROW_INDEX    = 1;
+const SUBTITLE_ROW_INDEX = 2;
+const BLANK_ROW_INDEX    = 3;
 const HEADER_ROW_INDEX   = 4;
 
 const BORDER = { style: "thin", color: { argb: "FF000000" } };
 
-/* Headers/widths */
 const SAP_HEADERS = [
   "Kontrakt","Position","Artskonto","Besrkivelse","Profitcenter",
   "Pris inkl. moms","Momskode","Pris ex. moms","Lokation/rute","Kunde"
@@ -56,7 +55,6 @@ const DET_BASE_WIDTHS = [
 ];
 const DAY_COL_WIDTH = 3.0;
 
-/* Which Detaljeret headers are numeric */
 const DET_NUMERIC_HEADERS = new Set([
   "I alt, kr","Saltning, kr","Salt, antal","Salt, gns. pris",
   "Kombi, kr","Kombi, antal","Kombi, gns. pris",
@@ -67,73 +65,30 @@ const SAP_NUMERIC_HEADERS = new Set([
   "Pris inkl. moms","Pris ex. moms"
 ]);
 
-/* -------------------- Robust number parsing --------------------
-   Goal: store EXACT numeric value from CSV; allow various user-entered styles.
-   - Strip spaces and semicolons (often used as group separators in exports).
-   - EU e.g. 1.234,56  -> 1234.56
-   - US e.g. 1,234.56  -> 1234.56
-   - Plain comma decimal  1234,56 -> 1234.56
-   - Plain dot decimal    570.843 -> 570.843
-   - Dot-grouped integer  1.234.567 -> 1234567
------------------------------------------------------------------ */
+/* -------------------- Number parsing -------------------- */
 function toNumberMaybe(v) {
-  if (v === null || v === undefined) return null;
+  if (v == null) return null;
   if (typeof v === "number") return Number.isFinite(v) ? v : null;
-
   let s = String(v).trim();
   if (!s) return null;
+  s = s.replace(/\s+/g, "").replace(/;/g, "");
 
-  s = s.replace(/\s+/g, "");
-  s = s.replace(/;/g, ""); // drop semicolon groupings if present
-
-  // EU style with decimal comma (must contain comma)
-  if (/,/.test(s) && /^\d{1,3}(\.\d{3})*(,\d+)?$/.test(s)) {
+  if (/,/.test(s) && /^\d{1,3}(\.\d{3})*(,\d+)?$/.test(s))
     s = s.replace(/\./g, "").replace(",", ".");
-    const n = Number(s);
-    return Number.isFinite(n) ? n : null;
-  }
-
-  // US style with comma thousands and dot decimals
-  if (/^\d{1,3}(,\d{3})+(\.\d+)?$/.test(s)) {
+  else if (/^\d{1,3}(,\d{3})+(\.\d+)?$/.test(s))
     s = s.replace(/,/g, "");
-    const n = Number(s);
-    return Number.isFinite(n) ? n : null;
-  }
-
-  // Plain comma decimal
-  if (/^\d+,\d+$/.test(s)) {
+  else if (/^\d+,\d+$/.test(s))
     s = s.replace(",", ".");
-    const n = Number(s);
-    return Number.isFinite(n) ? n : null;
-  }
-
-  // Plain dot decimal
-  if (/^\d+\.\d+$/.test(s)) {
-    const n = Number(s);
-    return Number.isFinite(n) ? n : null;
-  }
-
-  // Thousand groups with dots only
-  if (!/,/.test(s) && /^\d{1,3}(\.\d{3})+$/.test(s)) {
+  else if (/^\d{1,3}(\.\d{3})+$/.test(s))
     s = s.replace(/\./g, "");
-    const n = Number(s);
-    return Number.isFinite(n) ? n : null;
-  }
-
-  // Plain integer
-  if (/^\d+$/.test(s)) {
-    const n = Number(s);
-    return Number.isFinite(n) ? n : null;
-  }
 
   const n = Number(s);
   return Number.isFinite(n) ? n : null;
 }
 
-/* Keep day columns (1–31) as text; coerce only known numeric fields */
 function coerceByHeader(header, value) {
   const h = (header || "").trim();
-  if (/^\d{1,2}$/.test(h)) return value === "" ? null : String(value); // day columns -> text
+  if (/^\d{1,2}$/.test(h)) return value === "" ? null : String(value);
   if (DET_NUMERIC_HEADERS.has(h) || SAP_NUMERIC_HEADERS.has(h)) return toNumberMaybe(value);
   return value === "" ? null : value;
 }
@@ -224,76 +179,12 @@ function getValueForHeader(obj, hdr) {
   return k ? obj[k] : null;
 }
 
-/* -------------------- CSV parsing without row dropping -------------------- */
-function findHeaderIndex(rows, expectCandidates) {
-  let bestIdx = -1, bestScore = -1;
-  for (let i = 0; i < Math.min(rows.length, 12); i++) {
-    const r = rows[i].map(x => (x ?? "").toString().trim());
-    const score = expectCandidates.reduce(
-      (acc, h) => acc + (r.some(v => norm(v) === norm(h) || stripComma(v) === stripComma(h)) ? 1 : 0), 0
-    );
-    if (score > bestScore) { bestScore = score; bestIdx = i; }
-  }
-  return { idx: bestIdx, score: bestScore };
-}
-
-function parseWithDelimiter(raw, delimiter, expectedHeaders) {
-  const parsed = Papa.parse(raw, { header: false, delimiter, skipEmptyLines: false });
-  const rows = parsed.data.filter(Array.isArray);
-  const { idx, score } = findHeaderIndex(rows.slice(0, 12), expectedHeaders);
-  return { rows, headerIdx: idx, score };
-}
-
-function isNoiseRow(arr) {
-  const first = (arr[0] ?? "").toString().trim().toLowerCase();
-  const allEmpty = arr.every(v => (v ?? "").toString().trim() === "");
-  if (allEmpty) return true;
-  if (first.startsWith("udtrukket")) return true;
-  return false;
-}
-
+/* -------------------- Parsing -------------------- */
 function parseCsvFlexible(text, expectedHeaders) {
   const clean = (text || "").replace(/^\uFEFF/, "");
-
-  const candidates = [";", ",", "\t"];
-  let best = { rows: [], headerIdx: -1, score: -1, delimiter: ";" };
-  for (const d of candidates) {
-    const attempt = parseWithDelimiter(clean, d, expectedHeaders);
-    if (attempt.score > best.score) best = { ...attempt, delimiter: d };
-  }
-  const rows = best.rows;
-
-  // Title row if "Periode…"
-  let title = "";
-  const t0 = (rows[0]?.[0] || "").toString().replace(/^"+|"+$/g, "");
-  if (norm(t0).startsWith("periode")) title = t0;
-
-  const headerIdx = best.headerIdx >= 0 ? best.headerIdx : 0;
-
-  // Subtitle: first non-empty between title and header
-  let subtitle = "";
-  for (let i = 1; i < headerIdx; i++) {
-    const line = rows[i] || [];
-    const pieces = line.map(x => (x ?? "").toString().trim()).filter(Boolean);
-    if (pieces.length) { subtitle = pieces.join("  "); break; }
-  }
-
-  // Headers & data (no heuristic filtering)
-  const headers = (rows[headerIdx] || []).map(x => (x ?? "").toString().trim());
-  const data = [];
-  for (let i = headerIdx + 1; i < rows.length; i++) {
-    const arr = rows[i];
-    if (isNoiseRow(arr)) continue;
-
-    const obj = {};
-    for (let c = 0; c < headers.length; c++) {
-      const key = headers[c] || `col_${c + 1}`;
-      obj[key] = arr[c] ?? "";
-    }
-    data.push(obj);
-  }
-
-  return { title, subtitle, headers, rows: data };
+  const parsed = Papa.parse(clean, { header: true, skipEmptyLines: true });
+  const headers = parsed.meta.fields || expectedHeaders;
+  return { title: "", subtitle: "", headers, rows: parsed.data };
 }
 
 /* ------------------------------ Handler ------------------------------ */
@@ -306,23 +197,18 @@ module.exports = async (req, res) => {
   try {
     const body = typeof req.body === "string" ? JSON.parse(req.body || "{}") : (req.body || {});
     const {
-      sheet1_url, sheet1_csv, sheet1_headers,   // SAP
-      sheet2_url, sheet2_csv, sheet2_headers,   // Detaljeret
-      extracted_at,
-      file_name = "winter_fg.xlsx"
+      sheet1_url, sheet1_csv, sheet2_url, sheet2_csv,
+      extracted_at, file_name = "winter_fg.xlsx"
     } = body;
 
     const detDaysAll = Array.from({ length: 31 }, (_, i) => String(i + 1));
-
-    // Parse CSVs
-    const sapText = await readCsvText({ url: sheet1_url, csv: sheet1_csv, headers: sheet1_headers });
-    const detText = await readCsvText({ url: sheet2_url, csv: sheet2_csv, headers: sheet2_headers });
+    const sapText = await readCsvText({ url: sheet1_url, csv: sheet1_csv });
+    const detText = await readCsvText({ url: sheet2_url, csv: sheet2_csv });
 
     const sapParsed = parseCsvFlexible(sapText, SAP_HEADERS);
     const detParsed = parseCsvFlexible(detText, [...DET_BASE_HEADERS, ...detDaysAll]);
 
-    // Dynamic day columns present in Detaljeret
-    const detDays = detParsed.headers.map(h => (h || "").trim()).filter(h => /^\d{1,2}$/.test(h));
+    const detDays = detParsed.headers.filter(h => /^\d{1,2}$/.test(h));
     const DET_HEADERS = [...DET_BASE_HEADERS, ...detDays];
     const DET_WIDTHS  = [...DET_BASE_WIDTHS, ...new Array(detDays.length).fill(DAY_COL_WIDTH)];
     const footerDate = extracted_at || todayDk();
@@ -330,38 +216,28 @@ module.exports = async (req, res) => {
     const wb = new ExcelJS.Workbook();
     wb.calcProperties.fullCalcOnLoad = true;
 
-    /* -------- Detaljeret oversigt (first tab) -------- */
+    /* -------- Detaljeret oversigt -------- */
     const wsDET = wb.addWorksheet(SHEET_DET);
     wsDET.columns = DET_WIDTHS.map(w => ({ width: w }));
-
-    setTitle(wsDET, detParsed.title || sapParsed.title || "", DET_HEADERS.length);
-    const subtitleText = detParsed.subtitle || sapParsed.subtitle || "";
-    setSubtitle(wsDET, subtitleText, DET_HEADERS.length);
-
     writeHeader(wsDET, DET_HEADERS);
 
-    // Formatting rules: counts 0 decimals; money/avg 3 decimals; fallback 3
-    const decimalsForHeader = hdr => (/antal|kg/i.test(hdr) ? 0 : 3);
+    const decimalsForHeader = hdr => (/antal|kg/i.test(hdr) ? 0 : 2);
 
     let r = HEADER_ROW_INDEX + 1;
     detParsed.rows.forEach(obj => {
       const row = wsDET.getRow(r);
       DET_HEADERS.forEach((hdr, i) => {
         const raw = getValueForHeader(obj, hdr);
-        const val = coerceByHeader(hdr, raw);  // <— PARSED NUMERIC or text straight from CSV
+        const val = coerceByHeader(hdr, raw);
         const cell = row.getCell(i + 1);
 
         if (/^\d{1,2}$/.test(hdr)) {
-          // Day columns: keep as text (K/S etc.)
           cell.value = val === null ? null : String(val);
-          cell.numFmt = "General";
         } else if (typeof val === "number") {
-          // PURE number written; Excel formatting only (no string formatting)
-          cell.value = Number(val);
           const dec = decimalsForHeader(hdr);
-          cell.numFmt = dec === 0 ? "0" : "#,##0.000"; // comma thousands + dot decimal
+          cell.value = val;
+          cell.numFmt = dec === 0 ? "0" : "#,##0.00";
         } else {
-          // Text columns (IDs, names, addresses, etc.)
           cell.value = val === null ? null : String(val);
         }
       });
@@ -369,36 +245,23 @@ module.exports = async (req, res) => {
       r++;
     });
 
-    // Borders & totals
-    const detFirstDataRow = HEADER_ROW_INDEX + 1;
-    const detLast = r - 1;
-    if (detLast >= detFirstDataRow) {
-      addBorders(wsDET, detFirstDataRow, detLast, 1, DET_HEADERS.length);
-
-      // Totals for J..M remain live formulas over numeric cells
+    const first = HEADER_ROW_INDEX + 1;
+    const last = r - 1;
+    if (last >= first) {
+      addBorders(wsDET, first, last, 1, DET_HEADERS.length);
       const j = DET_HEADERS.indexOf("I alt, kr") + 1;
-      const k = DET_HEADERS.indexOf("Saltning, kr") + 1;         // K column (e.g., 570.843)
+      const k = DET_HEADERS.indexOf("Saltning, kr") + 1;
       const l = DET_HEADERS.indexOf("Salt, antal") + 1;
       const m = DET_HEADERS.indexOf("Salt, gns. pris") + 1;
-      const detTotalsRow = detLast + 1;
+      const totalRow = last + 1;
       const colsToSum = [j, k, l, m].filter(Boolean);
-      if (colsToSum.length) writeSumFormulas(wsDET, detTotalsRow, colsToSum, detFirstDataRow, detLast);
-
-      // Totals row display formats
-      if (j) wsDET.getCell(detTotalsRow, j).numFmt = "#,##0.000";
-      if (k) wsDET.getCell(detTotalsRow, k).numFmt = "#,##0.000";
-      if (l) wsDET.getCell(detTotalsRow, l).numFmt = "0";
-      if (m) wsDET.getCell(detTotalsRow, m).numFmt = "#,##0.000";
-
-      writeFooter(wsDET, 1, 3, detTotalsRow, footerDate);
-    } else {
-      writeFooter(wsDET, 1, 3, HEADER_ROW_INDEX, footerDate);
+      if (colsToSum.length) writeSumFormulas(wsDET, totalRow, colsToSum, first, last);
+      writeFooter(wsDET, 1, 3, totalRow, footerDate);
     }
 
-    /* -------- SAP (second tab) -------- */
+    /* -------- SAP -------- */
     const wsSAP = wb.addWorksheet(SHEET_SAP);
     wsSAP.columns = SAP_WIDTHS.map(w => ({ width: w }));
-    setTitle(wsSAP, sapParsed.title || detParsed.title || "", SAP_HEADERS.length);
     writeHeader(wsSAP, SAP_HEADERS);
 
     r = HEADER_ROW_INDEX + 1;
@@ -410,8 +273,9 @@ module.exports = async (req, res) => {
         const cell = row.getCell(i + 1);
 
         if (typeof val === "number") {
-          cell.value = Number(val);
-          if (/moms/i.test(hdr)) cell.numFmt = "#,##0.00"; else cell.numFmt = "0";
+          cell.value = val;
+          if (/moms/i.test(hdr)) cell.numFmt = "#,##0.00";
+          else cell.numFmt = "0";
         } else {
           cell.value = val === null ? null : String(val);
         }
@@ -420,19 +284,16 @@ module.exports = async (req, res) => {
       r++;
     });
 
-    const sapFirstDataRow = HEADER_ROW_INDEX + 1;
+    const sapFirst = HEADER_ROW_INDEX + 1;
     const sapLast = r - 1;
-    if (sapLast >= sapFirstDataRow) {
-      addBorders(wsSAP, sapFirstDataRow, sapLast, 1, SAP_HEADERS.length);
+    if (sapLast >= sapFirst) {
+      addBorders(wsSAP, sapFirst, sapLast, 1, SAP_HEADERS.length);
       const h = SAP_HEADERS.indexOf("Pris ex. moms") + 1;
       const sapTotalsRow = sapLast + 1;
-      if (h) writeSumFormulas(wsSAP, sapTotalsRow, [h], sapFirstDataRow, sapLast);
+      if (h) writeSumFormulas(wsSAP, sapTotalsRow, [h], sapFirst, sapLast);
       writeFooter(wsSAP, 1, 3, sapTotalsRow, footerDate);
-    } else {
-      writeFooter(wsSAP, 1, 3, HEADER_ROW_INDEX, footerDate);
     }
 
-    // Return file
     const buf = await toBuffer(wb);
     res.setHeader("Content-Type", "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet");
     res.setHeader("Content-Disposition", `attachment; filename="${file_name}"`);
